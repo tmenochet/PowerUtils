@@ -70,18 +70,56 @@ function Invoke-UserSniper {
 		}
 	}
 
-	$Props = @{Name='Domain';Expression={$_.Properties[6].Value}}, `
-		 @{Name='sAMAccountName';Expression={$_.Properties[5].Value}}, `
-		 @{Name='IpAddress';Expression={$_.Properties[18].Value}}, `
-		 @{Name='HostName';Expression={$_.Properties[11].Value}}, `
-		 @{Name='LogonProcess';Expression={$_.Properties[9].Value}}
+	$results = @()
 	ForEach ($DomainController in $DomainControllers) {
-		$Params = @{
-			'Computername' = $DomainController
-			'LogName' = 'Security'
-			'FilterXPath' = "*[System[EventID=4624] and EventData[Data[@Name='TargetUserName']='$Identity']]"
-			'MaxEvents' = 10
+		$FilterXPath = "*[System[EventID=4624] and EventData[Data[@Name='TargetUserName']='$Identity']]"
+		If ($Credential.UserName) {
+			$Username = $Credential.UserName
+			$Password = $Credential.GetNetworkCredential().Password
+			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /username:$Username /password:$Password /format:XML | ForEach {
+				[XML] $XML = ($_)
+				$Status = $XML.Event.System.Keywords
+				if ($Status -eq "0x8020000000000000") {
+					$results += ParseEventLog($XML)
+				}
+			}
+		} Else {
+			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /format:XML | ForEach {
+				[XML] $XML = ($_)
+				$Status = $XML.Event.System.Keywords
+				if ($Status -eq "0x8020000000000000") {
+					$results += ParseEventLog($XML)
+				}
+			}
 		}
-		Get-WinEvent @Params -Credential $Credential | Select-Object -Property  $Props | Sort-Object -Property 'IpAddress' -Unique
 	}
+	$results | Sort-Object -Property 'IpAddress' -Unique | Select TargetDomainName, TargetUserName, LogonType, IpAddress, WorkstationName
+}
+
+function ParseEventLog($XML) {
+	$props = @{}
+	$props.Add('DCEvent',$XML.Event.System.Computer)
+	$props.Add('Date',$XML.Event.System.TimeCreated.SystemTime)
+	$props.Add('EventId', $XML.Event.System.EventID)
+	$props.Add('SubjectUserSid', $XML.Event.EventData.Data[0].'#text')
+	$props.Add('SubjectUserName', $XML.Event.EventData.Data[1].'#text')
+	$props.Add('SubjectDomainName', $XML.Event.EventData.Data[2].'#text')
+	$props.Add('SubjectLogonId', $XML.Event.EventData.Data[3].'#text')
+	$props.Add('TargetUserSid', $XML.Event.EventData.Data[4].'#text')
+	$props.Add('TargetUserName', $XML.Event.EventData.Data[5].'#text')
+	$props.Add('TargetDomainName', $XML.Event.EventData.Data[6].'#text')
+	$props.Add('TargetLogonId', $XML.Event.EventData.Data[7].'#text')
+	$props.Add('LogonType', $XML.Event.EventData.Data[8].'#text')
+	$props.Add('LogonProcessName', $XML.Event.EventData.Data[9].'#text')
+	$props.Add('AuthenticationPackageName', $XML.Event.EventData.Data[10].'#text')
+	$props.Add('WorkstationName', $XML.Event.EventData.Data[11].'#text')
+	$props.Add('LogonGuid', $XML.Event.EventData.Data[12].'#text')
+	$props.Add('TransmittedServices', $XML.Event.EventData.Data[13].'#text')
+	$props.Add('LmPackageName', $XML.Event.EventData.Data[14].'#text')
+	$props.Add('KeyLength', $XML.Event.EventData.Data[15].'#text')
+	$props.Add('ProcessId', $XML.Event.EventData.Data[16].'#text')
+	$props.Add('ProcessName', $XML.Event.EventData.Data[17].'#text')
+	$props.Add('IpAddress', $XML.Event.EventData.Data[18].'#text')
+	$props.Add('IpPort', $XML.Event.EventData.Data[19].'#text')
+	return New-Object -TypeName psobject -Property $props
 }
