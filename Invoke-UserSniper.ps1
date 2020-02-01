@@ -13,15 +13,21 @@ function Invoke-UserSniper {
 .PARAMETER DomainController
     Specify a specific domain controller to query.
 
+.PARAMETER Domain
+    Specify the domain to query for domain controllers, defaults to the current domain.
+
+.PARAMETER Limit
+    Specify the maximal number of events to retrieve for the target user.
+
 .PARAMETER Credential
     Specify the privileged account to use (typically Domain Admin).
 
 .EXAMPLE
     PS C:\> . .\Invoke-UserSniper.ps1
-    PS C:\> Invoke-UserSniper -Identity john.doe
+    PS C:\> Invoke-UserSniper -Identity john.doe -Domain ADATUM.CORP
 
 .EXAMPLE
-    PS C:\> Invoke-UserSniper -Identity john.doe -Domain ADATUM.CORP -Credential ADATUM\Administrator
+    PS C:\> Invoke-UserSniper -Identity john.doe -DomainController 192.168.1.10 -Credential ADATUM\Administrator
 #>
 
 	Param (
@@ -35,6 +41,14 @@ function Invoke-UserSniper {
 		$DomainController,
 
 		[ValidateNotNullOrEmpty()]
+		[String]
+		$Domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().name,
+
+		[ValidateNotNullOrEmpty()]
+		[Int32]
+		$Limit = 10,
+
+		[ValidateNotNullOrEmpty()]
 		[System.Management.Automation.PSCredential]
 		[System.Management.Automation.Credential()]
 		$Credential = [System.Management.Automation.PSCredential]::Empty
@@ -44,7 +58,6 @@ function Invoke-UserSniper {
 	If ($DomainController) {
 		$DomainControllers += $DomainController
 	} Else {
-		$Domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().name
 		$DN = "DC=$($Domain.Replace('.', ',DC='))"
 		$SearchString = "LDAP://" + $DN
 		$Filter = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
@@ -60,7 +73,7 @@ function Invoke-UserSniper {
 			$Results | Where-Object {$_} | ForEach-Object {
 				$Up = Test-Connection -Count 1 -Quiet -ComputerName $_.properties.dnshostname
 				if($Up) {
-					$DomainControllers += $_.properties.dnshostname
+					$DomainControllers += [String]$_.properties.dnshostname
 				}
 			}
 			$Results.dispose()
@@ -76,19 +89,19 @@ function Invoke-UserSniper {
 		If ($Credential.UserName) {
 			$Username = $Credential.UserName
 			$Password = $Credential.GetNetworkCredential().Password
-			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /username:$Username /password:$Password /format:XML | ForEach {
+			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /username:$Username /password:$Password /format:XML /count:$Limit | ForEach {
 				[XML] $XML = ($_)
 				$Status = $XML.Event.System.Keywords
 				if ($Status -eq "0x8020000000000000") {
-					$results += ParseEventLog($XML)
+					$results += ParseLogonEvent($XML)
 				}
 			}
 		} Else {
-			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /format:XML | ForEach {
+			WevtUtil query-events Security /query:$FilterXPath /remote:$DomainController /format:XML /count:$Limit | ForEach {
 				[XML] $XML = ($_)
 				$Status = $XML.Event.System.Keywords
 				if ($Status -eq "0x8020000000000000") {
-					$results += ParseEventLog($XML)
+					$results += ParseLogonEvent($XML)
 				}
 			}
 		}
@@ -96,7 +109,7 @@ function Invoke-UserSniper {
 	$results | Sort-Object -Property 'IpAddress' -Unique | Select TargetDomainName, TargetUserName, LogonType, IpAddress, WorkstationName
 }
 
-function ParseEventLog($XML) {
+function ParseLogonEvent($XML) {
 	$props = @{}
 	$props.Add('DCEvent',$XML.Event.System.Computer)
 	$props.Add('Date',$XML.Event.System.TimeCreated.SystemTime)
