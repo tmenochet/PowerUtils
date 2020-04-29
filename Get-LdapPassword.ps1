@@ -6,7 +6,7 @@ function Get-LdapPassword {
     Author: Timothee MENOCHET (@TiM0)
 
 .DESCRIPTION
-    Get-LdapPassword queries domain controller via LDAP protocol for accounts with sensitive data in Description attribute and common attributes containing encoded passwords (UnixUserPassword, UserPassword, msSFU30Password, or unicodePwd).
+    Get-LdapPassword queries domain controller via LDAP protocol for accounts with sensitive data in Description attribute and common attributes containing passwords (UnixUserPassword, UserPassword, msSFU30Password, unicodePwd, or ms-MCS-AdmPwd).
 
 .PARAMETER Server
     Specifies the domain controller to query.
@@ -21,7 +21,7 @@ function Get-LdapPassword {
     PS C:\> Get-LdapPassword -Server ADATUM.CORP -Credential ADATUM\testuser
 
 .EXAMPLE
-    PS C:\> Get-LdapPassword -Server ADATUM.CORP -Keywords pwd,mdp
+    PS C:\> Get-LdapPassword -Server ADATUM.CORP -Keywords pw,mdp
 #>
 
     [CmdletBinding()]
@@ -56,48 +56,61 @@ function Get-LdapPassword {
         if ($account.description) {
             $password = $account.description
             $result = New-Object PSObject                                       
-            $result | add-member Noteproperty SamAccountName $account.sAMAccountName
-            $result | add-member Noteproperty Attribute 'Description'
-            $result | add-member Noteproperty Value $password
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'Description'
+            $result | Add-Member Noteproperty Value $password
             $result
         }
     }
 
     # Search for encoded password attributes
-    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)))"
+    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)(ms-MCS-AdmPwd=*)))"
     $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
         if ($account.UnixUserPassword) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.UnixUserPassword)
             $result = New-Object PSObject                                       
-            $result | add-member Noteproperty SamAccountName $account.sAMAccountName
-            $result | add-member Noteproperty Attribute 'UnixUserPassword'
-            $result | add-member Noteproperty Value $password
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'UnixUserPassword'
+            $result | Add-Member Noteproperty Value $password
             $result
         }
         if ($account.UserPassword) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.UserPassword)
             $result = New-Object PSObject                                       
-            $result | add-member Noteproperty SamAccountName $account.sAMAccountName
-            $result | add-member Noteproperty Attribute 'UserPassword'
-            $result | add-member Noteproperty Value $password
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'UserPassword'
+            $result | Add-Member Noteproperty Value $password
             $result
         }
         if ($account.msSFU30Password) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.msSFU30Password)
             $result = New-Object PSObject                                       
-            $result | add-member Noteproperty SamAccountName $account.sAMAccountName
-            $result | add-member Noteproperty Attribute 'msSFU30Password'
-            $result | add-member Noteproperty Value $password
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'msSFU30Password'
+            $result | Add-Member Noteproperty Value $password
             $result
         }
         if ($account.unicodePwd) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.unicodePwd)
             $result = New-Object PSObject                                       
-            $result | add-member Noteproperty SamAccountName $account.sAMAccountName
-            $result | add-member Noteproperty Attribute 'unicodePwd'
-            $result | add-member Noteproperty Value $password
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'unicodePwd'
+            $result | Add-Member Noteproperty Value $password
             $result
+        }
+        if ($account.'ms-MCS-AdmPwd') {
+            if ($account.'ms-MCS-AdmPwdExpirationTime' -ge 0) {
+                $expiration = $([datetime]::FromFileTime([convert]::ToInt64($account.'ms-MCS-AdmPwdExpirationTime',10)))
+            }
+            else{
+                $expiration = 'N/A'
+            }
+            $result = New-Object PSObject
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'ms-MCS-AdmPwd'
+            $result | Add-Member Noteproperty Value $account.'ms-MCS-AdmPwd'
+            $result | Add-Member Noteproperty Expiration $expiration
         }
     }
 }
