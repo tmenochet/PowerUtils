@@ -14,8 +14,14 @@ function Get-LdapPassword {
 .PARAMETER Credential
     Specify the domain account to use.
 
+.PARAMETER Keywords
+    Specify specific keywords to search for.
+
 .EXAMPLE
     PS C:\> Get-LdapPassword -Server ADATUM.CORP -Credential ADATUM\testuser
+
+.EXAMPLE
+    PS C:\> Get-LdapPassword -Server ADATUM.CORP -Keywords pwd,mdp
 #>
 
     [CmdletBinding()]
@@ -24,24 +30,28 @@ function Get-LdapPassword {
         [String]
         $Server = $Env:USERDNSDOMAIN,
 
+        [ValidateNotNullOrEmpty()]
         [System.Management.Automation.PSCredential]
         [System.Management.Automation.Credential()]
-        $Credential = [System.Management.Automation.PSCredential]::Empty
+        $Credential = [System.Management.Automation.PSCredential]::Empty,
+
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $Keywords = @("cred", "pass", "pw")
     )
 
-    $keywords = @(
-        "cred",
-        "pass",
-        "pw"
-    )
+    $searchString = "LDAP://$Server/RootDSE"
+    $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
+    $rootDN = $domainObject.rootDomainNamingContext[0]
+    $ADSpath = "LDAP://$Server/$rootDN"
 
     # Search for passwords in description attribute
     $filter = $null
-    ForEach ($keyword in $keywords) {
+    ForEach ($keyword in $Keywords) {
         $filter += "(description=*$keyword*)"
     }
-    $filter = "(|$filter)"
-    $accounts = Get-LdapUser -Filter $filter -Server $Server -Credential $Credential
+    $filter = "(&(objectClass=user)(|$filter))"
+    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties samAccountName,description -Credential $Credential
     ForEach ($account in $accounts) {
         if ($account.description) {
             $password = $account.description
@@ -54,8 +64,8 @@ function Get-LdapPassword {
     }
 
     # Search for encoded password attributes
-    $filter = "(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*))"
-    $accounts = Get-LdapUser -Filter $filter -Server $Server -Credential $Credential
+    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)))"
+    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
         if ($account.UnixUserPassword) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.UnixUserPassword)
@@ -92,15 +102,25 @@ function Get-LdapPassword {
     }
 }
 
-function Local:Get-LdapUser {
+function Local:Get-LdapObject {
     Param (
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [String] $Filter,
+        [String]
+        $ADSpath,
 
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [String] $Server,
+        [String]
+        $Filter,
+
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $Properties = '*',
+
+        [ValidateRange(1,10000)] 
+        [Int]
+        $PageSize = 200,
 
         [ValidateNotNullOrEmpty()]
         [System.Management.Automation.PSCredential]
@@ -108,19 +128,18 @@ function Local:Get-LdapUser {
         $Credential = [System.Management.Automation.PSCredential]::Empty
     )
 
-    $searchString = "LDAP://$Server/RootDSE"
-    $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
-    $rootDN = $domainObject.rootDomainNamingContext[0]
-    $searchString = "LDAP://$Server/$rootDN"
     if ($Credential.UserName) {
-        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($ADSpath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
         $searcher = New-Object System.DirectoryServices.DirectorySearcher($domainObject)
     }
     else {
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$searchString)
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$ADSpath)
     }
-    $searcher.filter = "(&(objectClass=user)$Filter)"
-    $searcher.PropertiesToLoad.Add('*') | Out-Null
+    $searcher.PageSize = $PageSize
+    $searcher.CacheResults = $false
+    $searcher.filter = $Filter
+    $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
+    $searcher.PropertiesToLoad.AddRange($propertiesToLoad) | Out-Null
     Try {
         $results = $searcher.FindAll()
         $results | Where-Object {$_} | ForEach-Object {
@@ -139,6 +158,6 @@ function Local:Get-LdapUser {
         $results.dispose()
         $searcher.dispose()
     } Catch {
-        Write-Error "$_" -ErrorAction Stop
+        Write-Error $_ -ErrorAction Stop
     }
 }
