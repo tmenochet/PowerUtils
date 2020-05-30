@@ -6,7 +6,7 @@ function Get-LdapPassword {
     Author: Timothee MENOCHET (@TiM0)
 
 .DESCRIPTION
-    Get-LdapPassword queries domain controller via LDAP protocol for accounts with sensitive data in Description attribute and common attributes containing passwords (UnixUserPassword, UserPassword, msSFU30Password, unicodePwd, or ms-MCS-AdmPwd).
+    Get-LdapPassword queries domain controller via LDAP protocol for accounts with sensitive data in Description attribute and common attributes containing passwords (UnixUserPassword, UserPassword, msSFU30Password, unicodePwd, ms-MCS-AdmPwd or msDS-ManagedPassword).
 
 .PARAMETER Server
     Specifies the domain controller to query.
@@ -99,6 +99,12 @@ function Get-LdapPassword {
             $result | Add-Member Noteproperty Value $password
             $result
         }
+    }
+
+    # Search for LAPS passwords
+    $filter = "(&(objectCategory=Computer)(ms-MCS-AdmPwd=*))"
+    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
+    ForEach ($account in $accounts) {
         if ($account.'ms-MCS-AdmPwd') {
             if ($account.'ms-MCS-AdmPwdExpirationTime' -ge 0) {
                 $expiration = $([datetime]::FromFileTime([convert]::ToInt64($account.'ms-MCS-AdmPwdExpirationTime',10)))
@@ -111,6 +117,21 @@ function Get-LdapPassword {
             $result | Add-Member Noteproperty Attribute 'ms-MCS-AdmPwd'
             $result | Add-Member Noteproperty Value $account.'ms-MCS-AdmPwd'
             $result | Add-Member Noteproperty Expiration $expiration
+            $result
+        }
+    }
+
+    # Search for GMSA passwords
+    $filter = "(&(objectClass=msDS-GroupManagedServiceAccount)(msDS-ManagedPasswordId=*))"
+    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
+    ForEach ($account in $accounts) {
+        if ($account.'msDS-ManagedPassword') {
+            $password = (ConvertFrom-ADManagedPasswordBlob -Blob $account.'msDS-ManagedPassword').CurrentPassword
+            $result = New-Object PSObject
+            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+            $result | Add-Member Noteproperty Attribute 'msDS-ManagedPassword'
+            $result | Add-Member Noteproperty Value $password
+            $result
         }
     }
 }
