@@ -14,7 +14,7 @@ function Get-LdapPassword {
 .PARAMETER Credential
     Specify the domain account to use.
 
-.PARAMETER Keywords
+.PARAMETER Attributes
     Specify specific attributes to search through.
 
 .PARAMETER Keywords
