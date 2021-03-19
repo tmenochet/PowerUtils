@@ -8,13 +8,16 @@ Function Invoke-AsSystem {
     Author: Timothee MENOCHET (@_tmenochet)
 
 .DESCRIPTION
-    Invoke-PowerExec runs PowerShell script block on local computer via scheduled job.
+    Invoke-AsSystem runs PowerShell script block on local computer via scheduled job.
 
 .PARAMETER ScriptBlock
     Specifies the PowerShell script block to run.
 
 .PARAMETER ArgumentList
     Specifies the PowerShell script block arguments.
+
+.PARAMETER Method
+    Specifies the execution method to use, defaults to ScheduledTask.
 
 .EXAMPLE
     PS C:\> Invoke-AsSystem -ScriptBlock {whoami}
@@ -27,7 +30,11 @@ Function Invoke-AsSystem {
         $ScriptBlock,
 
         [Object[]]
-        $ArgumentList
+        $ArgumentList,
+
+        [ValidateSet('ScheduledTask', 'Service')]
+        [String]
+        $Method = 'ScheduledTask'
     )
 
     try {
@@ -70,7 +77,14 @@ Function Invoke-AsSystem {
 '@)
         $scheduledJob = Register-ScheduledJob  @jobParameters -ScriptBlock $jobScriptBlock -ArgumentList $jobArgumentList -ErrorAction Stop
 
-        Invoke-ScheduledTask -Command $scheduledJob.PSExecutionPath -Arguments $scheduledJob.PSExecutionArgs
+        switch ($Method) {
+            'ScheduledTask' {
+                Invoke-ScheduledTask -Command $scheduledJob.PSExecutionPath -Arguments $scheduledJob.PSExecutionArgs
+            }
+            'Service' {
+                Invoke-Service -Command $scheduledJob.PSExecutionPath -Arguments $scheduledJob.PSExecutionArgs
+            }
+        }
 
         $job = Get-Job -Name $scheduledJob.Name -ErrorAction SilentlyContinue
         if ($job) {
@@ -124,11 +138,49 @@ Function Local:Invoke-ScheduledTask {
         }
     }
     catch { 
-        Write-Error $_ 
+        Write-Error "Task execution failed. $_"
     }
     finally {
         if ($scheduledTask) { 
             $scheduleTaskFolder.DeleteTask($scheduledTask.Name, 0) | Out-Null
+        }
+    }
+}
+
+Function Local:Invoke-Service {
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [String]
+        $Command,
+
+        [String]
+        $Arguments
+    )
+
+    try  {
+        $serviceName = [guid]::NewGuid().Guid
+        $servicePath = "%COMSPEC% /c $Command $Arguments"
+        $result = Invoke-WmiMethod -Class Win32_Service -Name Create -ArgumentList @($false, $serviceName, 1, $null, $null, $serviceName, $servicePath, $null, 16, 'Manual', 'LocalSystem', ' ')
+        if ($result.ReturnValue -eq 0) {
+            $service = Get-WmiObject -Class Win32_Service -Filter "Name='$serviceName'"
+            $service.InvokeMethod('StartService', $null) | Out-Null
+            do {
+                Start-Sleep -Seconds 1
+                $service = Get-WmiObject -Class Win32_Service -Filter "Name='$serviceName'"
+            }
+            until ($service.ExitCode -ne 1077 -or $service.State -ne 'Stopped')
+        }
+        else {
+            Write-Error "Service creation failed ($($result.ReturnValue))."
+        }
+    }
+    catch {
+        Write-Error "Service execution failed. $_"
+    }
+    finally {
+        if ($service) {
+            $service.InvokeMethod('Delete', $null) | Out-Null
         }
     }
 }
