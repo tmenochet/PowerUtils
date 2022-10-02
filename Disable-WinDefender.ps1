@@ -102,7 +102,7 @@ Function Disable-WinDefender {
                     }
                 }
                 else {
-                    Write-Output "[+] Driver $drv already deleted"
+                    Write-Output "[+] Driver $drv does not exist"
                 }
             }
         }
@@ -206,22 +206,30 @@ Function Local:Invoke-CommandAs {
 
         # Create scheduled task
         try {
-            $taskParameters = @{
-                TaskName = [guid]::NewGuid().Guid
-                Action = New-ScheduledTaskAction -Execute $scheduledJob.PSExecutionPath -Argument $scheduledJob.PSExecutionArgs
-                Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-                Principal = New-ScheduledTaskPrincipal -UserID $Identity -LogonType ServiceAccount -RunLevel Highest
-            }
-            Write-Verbose "[Invoke-CommandAs] Registering scheduled task $($taskParameters.TaskName)"
-            $scheduledTask = Register-ScheduledTask @taskParameters -ErrorAction Stop
+            $scheduleService = New-Object -ComObject ('Schedule.Service')
+            $scheduleService.Connect()
+            $scheduleTaskFolder = $scheduleService.GetFolder("\")
+            $taskDefinition = $scheduleService.NewTask(0)
+            $taskDefinition.Settings.StopIfGoingOnBatteries = $false
+            $taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+            $taskName = [guid]::NewGuid().Guid
+            $taskAction = $taskDefinition.Actions.Create(0)
+            $taskAction.Path = $scheduledJob.PSExecutionPath
+            $taskAction.Arguments = $scheduledJob.PSExecutionArgs 
+            Write-Verbose "[Invoke-CommandAs] Registering scheduled task $taskName"
+            $registeredTask = $scheduleTaskFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, $Identity, $null, 5)
             Write-Verbose "[Invoke-CommandAs] Running scheduled task as $Identity"
-            $cimJob = $scheduledTask | Start-ScheduledTask -AsJob -ErrorAction Stop
-            $cimJob | Wait-Job | Remove-Job -Force -Confirm:$False
+            $scheduledTask = $registeredTask.Run($null)
             do {
-                Start-Sleep -Seconds 1
+                $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name
+                Start-Sleep -Milliseconds 100
             }
-            while (($scheduledTaskInfo = $scheduledTask | Get-ScheduledTaskInfo).State -eq 4)
-
+            while ($scheduledTaskInfo.State -eq 3 -and $scheduledTaskInfo.LastTaskResult -eq 267045)
+            do {
+                $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name
+                Start-Sleep -Milliseconds 100
+            }
+            while ($scheduledTaskInfo.State -eq 4)
             if ($scheduledTaskInfo.LastRunTime.Year -ne (Get-Date).Year) { 
                 Write-Warning "[Invoke-CommandAs] Failed to execute scheduled task."
             }
@@ -230,8 +238,10 @@ Function Local:Invoke-CommandAs {
             Write-Error "[Invoke-CommandAs] Task execution failed. $_"
         }
         finally {
-            Write-Verbose "[Invoke-CommandAs] Unregistering scheduled task $($taskParameters.TaskName)"
-            $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$False | Out-Null
+            Write-Verbose "[Invoke-CommandAs] Unregistering scheduled task $taskName"
+            if ($scheduledTask) { 
+                $scheduleTaskFolder.DeleteTask($scheduledTask.Name, 0) | Out-Null
+            }
         }
 
         if ($job = Get-Job -Name $scheduledJob.Name -ErrorAction SilentlyContinue) {
