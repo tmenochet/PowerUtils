@@ -49,19 +49,6 @@ Function Invoke-AsSystem {
         if ($ArgumentList) {
             $jobArgumentList['ArgumentList'] = $ArgumentList
         }
-        $usingVariables = $ScriptBlock.ast.FindAll({$args[0] -is [Management.Automation.Language.UsingExpressionAst]},$True)
-        if ($usingVariables) {
-            $scriptText = $ScriptBlock.Ast.Extent.Text
-            $scriptOffSet = $ScriptBlock.Ast.Extent.StartOffset
-            foreach ($subExpression in ($usingVariables.SubExpression | Sort-Object { $_.Extent.StartOffset } -Descending)) {
-                $name = '__using_{0}' -f (([Guid]::NewGuid().guid) -Replace '-')
-                $expression = $subExpression.Extent.Text.Replace('$Using:','$').Replace('${Using:','${'); 
-                $value = [Management.Automation.PSSerializer]::Serialize((Invoke-Expression $expression))
-                $jobArgumentList['Using'] += [PSCustomObject]@{ Name = $name; Value = $value } 
-                $scriptText = $scriptText.Substring(0, ($subExpression.Extent.StartOffSet - $scriptOffSet)) + "`${Using:$name}" + $scriptText.Substring(($subExpression.Extent.EndOffset - $scriptOffSet))
-            }
-            $jobArgumentList['ScriptBlock'] = [ScriptBlock]::Create($scriptText.TrimStart('{').TrimEnd('}'))
-        }
         $jobScriptBlock = [ScriptBlock]::Create(@'
             Param($Parameters)
             $jobParameters = @{}
@@ -315,162 +302,6 @@ Function Local:Invoke-TokenCmd {
         $memsetAddr = Get-ProcAddress msvcrt.dll memset
         $memsetDelegate = Get-DelegateType @([IntPtr], [Int32], [IntPtr]) ([IntPtr])
         $memset = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($memsetAddr, $memsetDelegate)
-
-        Function Local:Get-PrimaryToken {
-            Param(
-                [Parameter(Mandatory = $True)]
-                [UInt32]
-                $ProcessId
-            )
-
-            # 0x4 = TOKEN_IMPERSONATE
-            # 0x2 = TOKEN_DUPLICATE
-            $tokenPrivs = 0x4 -bor 0x2
-            [IntPtr] $hToken = [IntPtr]::Zero
-
-            # Get handle for the process
-            # 0x400 = PROCESS_QUERY_INFORMATION
-            $hProcess = $OpenProcess.Invoke(0x400, $False, $ProcessId)
-            if ($hProcess -ne [IntPtr]::Zero) {
-                # Get process token
-                Write-Verbose "Getting primary token of process ID $ProcessId..."
-                $retVal = $OpenProcessToken.Invoke(([IntPtr][Int] $hProcess), $tokenPrivs, [ref] $hToken)
-                if (-not $retVal -or $hToken -eq [IntPtr]::Zero) {
-                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    Write-Verbose "Failed to get processes primary token. ProcessId: $ProcessId. ProcessName $((Get-Process -Id $ProcessId).Name). Error: $errorCode"
-                }
-                # Close handle
-                if (-not $CloseHandle.Invoke($hProcess)) {
-                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    Write-Verbose "Failed to close process handle, this is unexpected. ErrorCode: $errorCode"
-                }
-                $hProcess = [IntPtr]::Zero
-                return $hToken
-            }
-            return [IntPtr]::Zero
-        }
-
-        Function Local:Invoke-ProcessWithToken {
-            Param(
-                [Parameter(Mandatory=$true)]
-                [IntPtr]
-                $hToken,
-
-                [Parameter()]
-                [String]
-                $CreateProcess,
-
-                [Parameter()]
-                [String]
-                $ProcessArgs
-            )
-
-            $success = $False
-            [IntPtr] $hDulicateToken = [IntPtr]::Zero
-
-            # Duplicate the primary token
-            Write-Verbose "Duplicating the process primary token..."
-            # 0x02000000 = MAXIMUM_ALLOWED
-            $retVal = $DuplicateTokenEx.Invoke($hToken, 0x02000000, [IntPtr]::Zero, 3, 1, [Ref] $hDulicateToken)
-            if (-not $retVal) {
-                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Verbose "DuplicateTokenEx failed. Error code: $errorCode"
-            }
-
-            # Close handle for the primary token
-            if (-not $CloseHandle.Invoke($hToken)) {
-                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Verbose "Failed to close token handle, this is unexpected. Error code: $errorCode"
-            }
-            if ($hDulicateToken -ne [IntPtr]::Zero) {
-                # Impersonate user in a new process
-                $startupInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type] $STARTUPINFO)
-                [IntPtr] $startupInfoPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($startupInfoSize)
-                $memset.Invoke($startupInfoPtr, 0, $startupInfoSize) | Out-Null
-                [Runtime.InteropServices.Marshal]::WriteInt32($startupInfoPtr, $startupInfoSize)
-                $processInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type] $PROCESS_INFORMATION)
-                [IntPtr] $processInfoPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($processInfoSize)
-                $processNamePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("$CreateProcess")
-                $processArgsPtr = [IntPtr]::Zero
-                if (-not [String]::IsNullOrEmpty($ProcessArgs)) {
-                    $processArgsPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("`"$CreateProcess`" $ProcessArgs")
-                }
-
-                Write-Verbose "Creating a new process with alternate token..."
-                $retValue = $CreateProcessWithTokenW.Invoke($hDulicateToken, 0x0, $processNamePtr, $processArgsPtr, 0, [IntPtr]::Zero, [IntPtr]::Zero, $StartupInfoPtr, $ProcessInfoPtr)
-                if ($retValue) {
-                    $processInfo = [Runtime.InteropServices.Marshal]::PtrToStructure($processInfoPtr, [Type] $PROCESS_INFORMATION)
-                    $process = [Diagnostics.Process]::GetProcessById($processInfo.dwProcessId)
-                    $process.WaitForExit()
-                    # Free the handles returned in the ProcessInfo structure
-                    $CloseHandle.Invoke($processInfo.hProcess) | Out-Null
-                    $CloseHandle.Invoke($processInfo.hThread) | Out-Null
-                }
-                else {
-                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    Write-Warning "Process creation failed. Error code: $errorCode"
-                }
-
-                # Free StartupInfo memory and ProcessInfo memory
-                [Runtime.InteropServices.Marshal]::FreeHGlobal($startupInfoPtr)
-                [Runtime.InteropServices.Marshal]::FreeHGlobal($processInfoPtr)
-                [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($processNamePtr)
-
-                # Close handle for the token duplicated
-                if (-not $CloseHandle.Invoke($hDulicateToken)) {
-                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    Write-Warning "CloseHandle failed to close NewHToken. Error code: $errorCode"
-                }
-                else {
-                    $success = $True
-                }
-            }
-            return $success
-        }
-
-        Function Local:Get-SystemToken {
-            Param(
-                [Parameter()]
-                [String]
-                $CreateProcess,
-
-                [Parameter()]
-                [String]
-                $ProcessArgs
-            )
-
-            $success = $False
-            $localSystemNTAccount = (New-Object -TypeName 'System.Security.Principal.SecurityIdentifier' -ArgumentList ([Security.Principal.WellKnownSidType]::'LocalSystemSid', $null)).Translate([Security.Principal.NTAccount]).Value
-
-            # Enumerate processes
-            Get-WmiObject -Class Win32_Process | ForEach-Object {
-                if ($success) {
-                    break
-                }
-                else {
-                    $ownerInfo = $_.GetOwner()
-                    $ownerString = "$($ownerInfo.Domain)\$($ownerInfo.User)".ToUpper()
-                    if ($ownerString -eq $localSystemNTAccount.ToUpper()) {
-                        try {
-                            # Get primary token
-                            $hToken = Get-PrimaryToken -ProcessId $_.ProcessId
-                            # Impersonate user
-                            if ($hToken -ne [IntPtr]::Zero) {
-                                if ($success = Invoke-ProcessWithToken -hToken $hToken -CreateProcess $CreateProcess -ProcessArgs $ProcessArgs) {
-                                    Write-Verbose "Process $($_.Name) (PID $($_.ProcessId)) impersonated!"
-                                }
-                            }
-                        }
-                        catch {
-                            Write-Error $_
-                        }
-                    }
-                }
-            }
-            if (-not $success) {
-                Write-Error 'Unable to obtain a handle to a system process.'
-            }
-        }
     }
 
     Process {
@@ -479,8 +310,73 @@ Function Local:Invoke-TokenCmd {
             Write-Error "This script must be run in STA mode, relaunch powershell.exe with -STA flag" -ErrorAction Stop
         }
 
-        # Attempt to elevate to SYSTEM
-        Get-SystemToken -CreateProcess $Env:COMSPEC -ProcessArgs "/c $Command $Arguments"
+        $process = $Env:COMSPEC
+        $processArgs = "/c $Command $Arguments"
+
+        $winlogonPid = Get-Process -Name "winlogon" | Select-Object -First 1 -ExpandProperty Id
+
+        Write-Verbose "Getting the primary token of process winlogon.exe ($winlogonPid)..."
+        if (($hProcess = $OpenProcess.Invoke(0x400, $False, $winlogonPid)) -eq [IntPtr]::Zero) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Error $([ComponentModel.Win32Exception] $errorCode)
+        }
+        $hToken = [IntPtr]::Zero
+        if (-not $OpenProcessToken.Invoke(([IntPtr][Int] $hProcess), 0x0E, [ref] $hToken)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Error $([ComponentModel.Win32Exception] $errorCode)
+        }
+        if (-not $CloseHandle.Invoke($hProcess)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Verbose "Failed to close process handle, this is unexpected. ErrorCode: $errorCode"
+        }
+
+        Write-Verbose "Duplicating the process primary token..."
+        $hDulicateToken = [IntPtr]::Zero
+        if (-not $DuplicateTokenEx.Invoke($hToken, 0x02000000, [IntPtr]::Zero, 0x02, 0x01, [Ref] $hDulicateToken)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Error $([ComponentModel.Win32Exception] $errorCode)
+        }
+        if ($hDulicateToken -eq [IntPtr]::Zero) {
+            Write-Error "Failed to duplicate the process token, this is unexpected."
+        }
+        if (-not $CloseHandle.Invoke($hToken)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Verbose "Failed to close token handle, this is unexpected. ErrorCode: $errorCode"
+        }
+
+        Write-Verbose "Creating a new process with alternate token..."
+        $startupInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type] $STARTUPINFO)
+        [IntPtr] $startupInfoPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($startupInfoSize)
+        $memset.Invoke($startupInfoPtr, 0, $startupInfoSize) | Out-Null
+        [Runtime.InteropServices.Marshal]::WriteInt32($startupInfoPtr, $startupInfoSize)
+        $processInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type] $PROCESS_INFORMATION)
+        [IntPtr] $processInfoPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($processInfoSize)
+        $processNamePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("$process")
+        $processArgsPtr = [IntPtr]::Zero
+        if (-not [String]::IsNullOrEmpty($ProcessArgs)) {
+            $processArgsPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni("`"$process`" $processArgs")
+        }
+        if (-not $CreateProcessWithTokenW.Invoke($hDulicateToken, 0x0, $processNamePtr, $processArgsPtr, 0, [IntPtr]::Zero, [IntPtr]::Zero, $StartupInfoPtr, $ProcessInfoPtr)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Error $([ComponentModel.Win32Exception] $errorCode)
+        }
+        $processInfo = [Runtime.InteropServices.Marshal]::PtrToStructure($processInfoPtr, [Type] $PROCESS_INFORMATION)
+        $process = [Diagnostics.Process]::GetProcessById($processInfo.dwProcessId)
+        $process.WaitForExit()
+
+        Write-Verbose "Process ended. Freeing memory..."
+        # Free the handles returned in the ProcessInfo structure
+        $CloseHandle.Invoke($processInfo.hProcess) | Out-Null
+        $CloseHandle.Invoke($processInfo.hThread) | Out-Null
+        # Free StartupInfo memory and ProcessInfo memory
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($startupInfoPtr)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($processInfoPtr)
+        [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($processNamePtr)
+        # Close handle for the token duplicated
+        if (-not $CloseHandle.Invoke($hDulicateToken)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Verbose "Failed to close token handle, this is unexpected. ErrorCode: $errorCode"
+        }
     }
 
     End {}

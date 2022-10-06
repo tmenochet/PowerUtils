@@ -176,19 +176,6 @@ Function Local:Invoke-CommandAs {
         if ($ArgumentList) {
             $jobArgumentList['ArgumentList'] = $ArgumentList
         }
-        $usingVariables = $ScriptBlock.ast.FindAll({$args[0] -is [Management.Automation.Language.UsingExpressionAst]},$True)
-        if ($usingVariables) {
-            $scriptText = $ScriptBlock.Ast.Extent.Text
-            $scriptOffSet = $ScriptBlock.Ast.Extent.StartOffset
-            foreach ($subExpression in ($usingVariables.SubExpression | Sort-Object { $_.Extent.StartOffset } -Descending)) {
-                $name = '__using_{0}' -f (([Guid]::NewGuid().guid) -Replace '-')
-                $expression = $subExpression.Extent.Text.Replace('$Using:','$').Replace('${Using:','${'); 
-                $value = [Management.Automation.PSSerializer]::Serialize((Invoke-Expression $expression))
-                $jobArgumentList['Using'] += [PSCustomObject]@{ Name = $name; Value = $value } 
-                $scriptText = $scriptText.Substring(0, ($subExpression.Extent.StartOffSet - $scriptOffSet)) + "`${Using:$name}" + $scriptText.Substring(($subExpression.Extent.EndOffset - $scriptOffSet))
-            }
-            $jobArgumentList['ScriptBlock'] = [ScriptBlock]::Create($scriptText.TrimStart('{').TrimEnd('}'))
-        }
         $jobScriptBlock = [ScriptBlock]::Create(@'
             Param($Parameters)
             $jobParameters = @{}
