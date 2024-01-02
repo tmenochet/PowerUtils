@@ -34,16 +34,16 @@ Function Invoke-AsLoggedOnUser {
         $Identity = 'NT SERVICE\TrustedInstaller'
     )
 
-    # Init named pipe client
+    # Init variables
     $timeout = 10000 # 10s
     $pipename = [guid]::NewGuid().Guid
-    $pipeclient = New-Object IO.Pipes.NamedPipeClientStream('localhost', $pipename, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::None, [Security.Principal.TokenImpersonationLevel]::Impersonation)
+    $Global:output = $null
 
     # Build loader
     $loader = ''
-    $loader += '$s = New-Object IO.Pipes.NamedPipeServerStream(''' + $pipename + ''', 3); '
-    $loader += '$s.WaitForConnection(); '
-    $loader += '$r = New-Object IO.StreamReader $s; '
+    $loader += '$c = New-Object IO.Pipes.NamedPipeClientStream(''.'', ''' + $pipename + ''', [IO.Pipes.PipeDirection]::InOut); '
+    $loader += '$c.Connect(' + $timeout + '); '
+    $loader += '$r = New-Object IO.StreamReader $c; '
     $loader += '$x = ''''; '
     $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
     $loader += '$z = [ScriptBlock]::Create($x); '
@@ -62,14 +62,48 @@ Function Invoke-AsLoggedOnUser {
     }
     $script += '$output = [Management.Automation.PSSerializer]::Serialize(((New-Module -ScriptBlock $scriptBlock -ArgumentList $args -ReturnResult) *>&1))' + [Environment]::NewLine
     $script += '$encOutput = [char[]]$output' + [Environment]::NewLine
-    $script += '$writer = [IO.StreamWriter]::new($s)' + [Environment]::NewLine
+    $script += '$writer = [IO.StreamWriter]::new($c)' + [Environment]::NewLine
     $script += '$writer.AutoFlush = $true' + [Environment]::NewLine
     $script += '$writer.WriteLine($encOutput)' + [Environment]::NewLine
     $script += '$writer.Dispose()' + [Environment]::NewLine
     $script += '$r.Dispose()' + [Environment]::NewLine
-    $script += '$s.Dispose()' + [Environment]::NewLine
+    $script += '$c.Dispose()' + [Environment]::NewLine
     $script = $script -creplace '(?m)^\s*\r?\n',''
     $payload = [char[]] $script
+
+    # Create named pipe server
+    try {
+        $accessRule = New-Object IO.Pipes.PipeAccessRule("Everyone", "FullControl", "Allow")
+        $pipeSecurity = New-Object IO.Pipes.PipeSecurity
+        $pipeSecurity.AddAccessRule($accessRule)
+        $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipename, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
+        $serverCallback = [AsyncCallback] {
+            param([IAsyncResult] $iar)
+            Write-Verbose "Client connected to named pipe server \\.\pipe\$pipename"
+            $pipeServer.EndWaitForConnection($iar)
+            Write-Verbose "Delivering payload"
+            $writer = New-Object IO.StreamWriter($pipeServer)
+            $writer.AutoFlush = $true
+            $writer.WriteLine($payload)
+            Write-Verbose "Getting execution output"
+            $reader = New-Object IO.StreamReader($pipeServer)
+            $output = ''
+            while (($data = $reader.ReadLine()) -ne $null) {
+                $output += $data + [Environment]::NewLine
+            }
+            $Global:output = ([Management.Automation.PSSerializer]::Deserialize($output))
+            $reader.Dispose()
+        }
+        $runspacedDelegate = [RunspacedDelegateFactory]::NewRunspacedDelegate($serverCallback, [Runspace]::DefaultRunspace)
+        $job = $pipeServer.BeginWaitForConnection($runspacedDelegate, $null)
+    }
+    catch {
+        if ($pipeServer) {
+            $pipeServer.Close()
+            $pipeServer.Dispose()
+        }
+        Write-Error "Pipe named server failed to start. $_" -ErrorAction Stop
+    }
 
     # Create scheduled task
     try {
@@ -93,20 +127,14 @@ Function Invoke-AsLoggedOnUser {
         $registeredTask = $scheduleTaskFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, $Identity, $null, 3)
         Write-Verbose "Running scheduled task as $Identity"
         $scheduledTask = $registeredTask.Run($null)
-
-        Write-Verbose "Connecting to named pipe server \\.\pipe\$pipename"
-        $pipeclient.Connect($timeout)
-        $writer = New-Object  IO.StreamWriter($pipeclient)
-        $writer.AutoFlush = $true
-        $writer.WriteLine($payload)
-        $reader = New-Object IO.StreamReader($pipeclient)
-        $output = ''
-        while (($data = $reader.ReadLine()) -ne $null) {
-            $output += $data + [Environment]::NewLine
+        do {
+            $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name; Start-Sleep -Milliseconds 100
         }
-        Write-Output ([Management.Automation.PSSerializer]::Deserialize($output))
-
-        $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name
+        while ($scheduledTaskInfo.State -eq 3 -and $scheduledTaskInfo.LastTaskResult -eq 267045)
+        do {
+            $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name; Start-Sleep -Milliseconds 100
+        }
+        while ($scheduledTaskInfo.State -eq 4)
         if ($scheduledTaskInfo.LastRunTime.Year -ne (Get-Date).Year) { 
             Write-Warning "Failed to execute scheduled task."
         }
@@ -115,14 +143,38 @@ Function Invoke-AsLoggedOnUser {
         Write-Error "Task execution failed. $_"
     }
     finally {
-        if ($reader) {
-            $reader.Dispose()
-        }
-        $pipeclient.Dispose()
-
         Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)"
         if ($scheduledTask) { 
             $scheduleTaskFolder.DeleteTask($scheduledTask.Name, 0) | Out-Null
         }
     }
+
+    $pipeServer.Close()
+    $pipeServer.Dispose()
+    Write-Output ($Global:output)
 }
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Management.Automation.Runspaces;
+public class RunspacedDelegateFactory {
+    public static Delegate NewRunspacedDelegate(Delegate _delegate, Runspace runspace) {
+        Action setRunspace = () => Runspace.DefaultRunspace = runspace;
+        return ConcatActionToDelegate(setRunspace, _delegate);
+    }
+    private static Expression ExpressionInvoke(Delegate _delegate, params Expression[] arguments) {
+        var invokeMethod = _delegate.GetType().GetMethod("Invoke");
+        return Expression.Call(Expression.Constant(_delegate), invokeMethod, arguments);
+    }
+    public static Delegate ConcatActionToDelegate(Action a, Delegate d) {
+        var parameters = d.GetType().GetMethod("Invoke").GetParameters().Select(p => Expression.Parameter(p.ParameterType, p.Name)).ToArray();
+        Expression body = Expression.Block(ExpressionInvoke(a), ExpressionInvoke(d, parameters));
+        var lambda = Expression.Lambda(d.GetType(), body, parameters);
+        var compiled = lambda.Compile();
+        return compiled;
+    }
+}
+'@
