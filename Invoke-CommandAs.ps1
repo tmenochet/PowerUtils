@@ -187,7 +187,12 @@ Function Invoke-CommandAs {
             $pipeclient.Dispose()
 
             Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)"
-            $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$False | Out-Null
+            if ($Protocol -eq 'Wsman') {
+                $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$False | Out-Null
+            }
+            else {
+                $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask | Out-Null
+            }
         }
     }
 
