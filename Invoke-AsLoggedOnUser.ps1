@@ -567,7 +567,7 @@ Function Local:Invoke-TokenCmd {
             }
         }
 
-        Write-Verbose "Enabling privilege SeAssignPrimaryTokenPrivilege"
+        Write-Verbose "Enabling privilege SeAssignPrimaryTokenPrivilege..."
         # Required for calling CreateProcessAsUserW
         Enable-Privilege -Privilege SeAssignPrimaryTokenPrivilege
 
