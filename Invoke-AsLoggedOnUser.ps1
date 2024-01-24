@@ -80,7 +80,8 @@ Function Invoke-AsLoggedOnUser {
 
     # Create named pipe server
     try {
-        $accessRule = New-Object IO.Pipes.PipeAccessRule("Everyone", "FullControl", "Allow")
+        $everyoneSid = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::WorldSid, $null)
+        $accessRule = New-Object IO.Pipes.PipeAccessRule($everyoneSid, "FullControl", "Allow")
         $pipeSecurity = New-Object IO.Pipes.PipeSecurity
         $pipeSecurity.AddAccessRule($accessRule)
         $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipename, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
