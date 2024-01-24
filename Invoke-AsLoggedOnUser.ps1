@@ -160,7 +160,10 @@ Function Local:Invoke-ScheduledTaskCmd {
         $taskAction.WorkingDirectory = $WorkingDirectory
         $taskAction.Path = $Command
         $taskAction.Arguments = $Arguments
-        $taskAction.HideAppWindow = $True
+        try {
+            $taskAction.HideAppWindow = $True
+        }
+        catch {}
 
         Write-Verbose "Registering scheduled task $taskName"
         $registeredTask = $scheduleTaskFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, $Identity, $null, 3)
