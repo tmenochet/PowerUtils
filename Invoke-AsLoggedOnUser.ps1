@@ -18,7 +18,7 @@ Function Invoke-AsLoggedOnUser {
     Specifies the execution method to use, defaults to ScheduledTask.
 
 .PARAMETER Identity
-    Specifies the account to use, defaults to 'NT AUTHORITY\SYSTEM'.
+    Specifies the accounts to use for remote execution, defaults to all logged on users.
 
 .EXAMPLE
     PS C:\> Invoke-AsLoggedOnUser -ScriptBlock {whoami} -Identity 'ADATUM\testuser'
@@ -37,94 +37,113 @@ Function Invoke-AsLoggedOnUser {
         [String]
         $Method = 'ScheduledTask',
 
-        [String]
-        $Identity = 'NT AUTHORITY\SYSTEM'
+        [String[]]
+        $Identity = '*'
     )
 
-    # Init variables
-    $timeout = 10000 # 10s
-    $pipename = [guid]::NewGuid().Guid
-    $Global:output = $null
-
-    # Build loader
-    $loader = ''
-    $loader += '$c = New-Object IO.Pipes.NamedPipeClientStream(''.'', ''' + $pipename + ''', [IO.Pipes.PipeDirection]::InOut); '
-    $loader += '$c.Connect(' + $timeout + '); '
-    $loader += '$r = New-Object IO.StreamReader $c; '
-    $loader += '$x = ''''; '
-    $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
-    $loader += '$z = [ScriptBlock]::Create($x); '
-    $loader += '& $z'
-    $arguments = '-NoP -NonI -W 1 -C "' + $loader + '"'
-
-    # Build payload
-    $script = ''
-    $script += '[ScriptBlock]$scriptBlock = {' + $ScriptBlock.Ast.Extent.Text + '}' + [Environment]::NewLine -replace '{{','{' -replace '}}','}'
-    if ($ArgumentList) {
-        $args = $ArgumentList -join ','
-        $script += '$args = ' + $args + [Environment]::NewLine
+    $loggedonUsers = @()
+    if ($Identity -eq '*') {
+        Get-WmiObject -ClassName Win32_LogonSession -Verbose:$false | Where-Object {$_.LogonType -ne 3} | ForEach-Object {
+            $session = $_
+            try {
+                $loggedonUsers += (Get-WmiObject -Query "Associators of {Win32_LogonSession.LogonId=$($session.LogonId)} Where AssocClass=Win32_LoggedOnUser Role=Dependent").Name
+            }
+            catch [Microsoft.Management.Infrastructure.CimException] {
+                break
+            }
+        }
+        $loggedonUsers = $loggedonUsers | Select -Unique
     }
     else {
-        $script += '$args = $null' + [Environment]::NewLine
+        $loggedonUsers += $Identity
     }
-    $script += '$output = [Management.Automation.PSSerializer]::Serialize(((New-Module -ScriptBlock $scriptBlock -ArgumentList $args -ReturnResult) *>&1))' + [Environment]::NewLine
-    $script += '$encOutput = [char[]]$output' + [Environment]::NewLine
-    $script += '$writer = [IO.StreamWriter]::new($c)' + [Environment]::NewLine
-    $script += '$writer.AutoFlush = $true' + [Environment]::NewLine
-    $script += '$writer.WriteLine($encOutput)' + [Environment]::NewLine
-    $script += '$writer.Dispose()' + [Environment]::NewLine
-    $script += '$r.Dispose()' + [Environment]::NewLine
-    $script += '$c.Dispose()' + [Environment]::NewLine
-    $script = $script -creplace '(?m)^\s*\r?\n',''
-    $payload = [char[]] $script
 
-    # Create named pipe server
-    try {
-        $everyoneSid = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::WorldSid, $null)
-        $accessRule = New-Object IO.Pipes.PipeAccessRule($everyoneSid, "FullControl", "Allow")
-        $pipeSecurity = New-Object IO.Pipes.PipeSecurity
-        $pipeSecurity.AddAccessRule($accessRule)
-        $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipename, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
-        $serverCallback = [AsyncCallback] {
-            Param ([IAsyncResult] $iar)
-            Write-Verbose "Client connected to named pipe server \\.\pipe\$pipename"
-            $pipeServer.EndWaitForConnection($iar)
-            Write-Verbose "Delivering payload"
-            $writer = New-Object IO.StreamWriter($pipeServer)
-            $writer.AutoFlush = $true
-            $writer.WriteLine($payload)
-            Write-Verbose "Getting execution output"
-            $reader = New-Object IO.StreamReader($pipeServer)
-            $output = ''
-            while (($data = $reader.ReadLine()) -ne $null) {
-                $output += $data + [Environment]::NewLine
+    foreach ($loggedonUser in $loggedonUsers) {
+        # Init variables
+        $timeout = 10000 # 10s
+        $pipename = [guid]::NewGuid().Guid
+        $Global:output = $null
+
+        # Build loader
+        $loader = ''
+        $loader += '$c = New-Object IO.Pipes.NamedPipeClientStream(''.'', ''' + $pipename + ''', [IO.Pipes.PipeDirection]::InOut); '
+        $loader += '$c.Connect(' + $timeout + '); '
+        $loader += '$r = New-Object IO.StreamReader $c; '
+        $loader += '$x = ''''; '
+        $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
+        $loader += '$z = [ScriptBlock]::Create($x); '
+        $loader += '& $z'
+        $arguments = '-NoP -NonI -W 1 -C "' + $loader + '"'
+
+        # Build payload
+        $script = ''
+        $script += '[ScriptBlock]$scriptBlock = {' + $ScriptBlock.Ast.Extent.Text + '}' + [Environment]::NewLine -replace '{{','{' -replace '}}','}'
+        if ($ArgumentList) {
+            $args = $ArgumentList -join ','
+            $script += '$args = ' + $args + [Environment]::NewLine
+        }
+        else {
+            $script += '$args = $null' + [Environment]::NewLine
+        }
+        $script += '$output = [Management.Automation.PSSerializer]::Serialize(((New-Module -ScriptBlock $scriptBlock -ArgumentList $args -ReturnResult) *>&1))' + [Environment]::NewLine
+        $script += '$encOutput = [char[]]$output' + [Environment]::NewLine
+        $script += '$writer = [IO.StreamWriter]::new($c)' + [Environment]::NewLine
+        $script += '$writer.AutoFlush = $true' + [Environment]::NewLine
+        $script += '$writer.WriteLine($encOutput)' + [Environment]::NewLine
+        $script += '$writer.Dispose()' + [Environment]::NewLine
+        $script += '$r.Dispose()' + [Environment]::NewLine
+        $script += '$c.Dispose()' + [Environment]::NewLine
+        $script = $script -creplace '(?m)^\s*\r?\n',''
+        $payload = [char[]] $script
+
+        # Create named pipe server
+        try {
+            $everyoneSid = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::WorldSid, $null)
+            $accessRule = New-Object IO.Pipes.PipeAccessRule($everyoneSid, "FullControl", "Allow")
+            $pipeSecurity = New-Object IO.Pipes.PipeSecurity
+            $pipeSecurity.AddAccessRule($accessRule)
+            $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipename, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
+            $serverCallback = [AsyncCallback] {
+                Param ([IAsyncResult] $iar)
+                Write-Verbose "Client connected to named pipe server \\.\pipe\$pipename"
+                $pipeServer.EndWaitForConnection($iar)
+                Write-Verbose "Delivering payload"
+                $writer = New-Object IO.StreamWriter($pipeServer)
+                $writer.AutoFlush = $true
+                $writer.WriteLine($payload)
+                Write-Verbose "Getting execution output"
+                $reader = New-Object IO.StreamReader($pipeServer)
+                $output = ''
+                while (($data = $reader.ReadLine()) -ne $null) {
+                    $output += $data + [Environment]::NewLine
+                }
+                $Global:output = ([Management.Automation.PSSerializer]::Deserialize($output))
+                $reader.Dispose()
             }
-            $Global:output = ([Management.Automation.PSSerializer]::Deserialize($output))
-            $reader.Dispose()
+            $runspacedDelegate = [RunspacedDelegateFactory]::NewRunspacedDelegate($serverCallback, [Runspace]::DefaultRunspace)
+            $job = $pipeServer.BeginWaitForConnection($runspacedDelegate, $null)
         }
-        $runspacedDelegate = [RunspacedDelegateFactory]::NewRunspacedDelegate($serverCallback, [Runspace]::DefaultRunspace)
-        $job = $pipeServer.BeginWaitForConnection($runspacedDelegate, $null)
-    }
-    catch {
-        if ($pipeServer) {
-            $pipeServer.Close()
-            $pipeServer.Dispose()
+        catch {
+            if ($pipeServer) {
+                $pipeServer.Close()
+                $pipeServer.Dispose()
+            }
+            Write-Error "Pipe named server failed to start. $_" -ErrorAction Stop
         }
-        Write-Error "Pipe named server failed to start. $_" -ErrorAction Stop
-    }
 
-    switch ($Method) {
-        'ScheduledTask' {
-            Invoke-ScheduledTaskCmd -Command 'powershell' -Arguments $arguments -WorkingDirectory '%windir%\System32\WindowsPowerShell\v1.0\' -Identity $Identity
+        switch ($Method) {
+            'ScheduledTask' {
+                Invoke-ScheduledTaskCmd -Command 'powershell' -Arguments $arguments -WorkingDirectory '%windir%\System32\WindowsPowerShell\v1.0\' -Identity $loggedonUser
+            }
+            'Token' {
+                Invoke-TokenCmd -Command 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Arguments $arguments -Identity $loggedonUser
+            }
         }
-        'Token' {
-            Invoke-TokenCmd -Command 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Arguments $arguments -Identity $Identity
-        }
-    }
 
-    $pipeServer.Close()
-    $pipeServer.Dispose()
-    Write-Output ($Global:output)
+        $pipeServer.Close()
+        $pipeServer.Dispose()
+        Write-Output ($Global:output)
+    }
 }
 
 Function Local:Invoke-ScheduledTaskCmd {

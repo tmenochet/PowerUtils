@@ -30,7 +30,7 @@ Function Invoke-CommandAs {
     Specifies the PowerShell script block arguments.
 
 .PARAMETER Identity
-    Specifies the account to use for remote execution, defaults to 'NT AUTHORITY\SYSTEM'.
+    Specifies the accounts to use for remote execution, defaults to all logged on users.
 
 .EXAMPLE
     PS C:\> Invoke-CommandAs -ComputerName SRV.ADATUM.CORP -Credential ADATUM\Administrator -ScriptBlock {whoami} -Identity 'ADATUM\testuser'
@@ -65,8 +65,8 @@ Function Invoke-CommandAs {
         [Object[]]
         $ArgumentList,
 
-        [String]
-        $Identity = 'NT AUTHORITY\SYSTEM'
+        [String[]]
+        $Identity = '*'
     )
 
     Begin {
@@ -110,88 +110,107 @@ Function Invoke-CommandAs {
             }
         }
 
-        # Init named pipe client
-        $timeout = 10000 # 10s
-        $pipename = [guid]::NewGuid().Guid
-        $pipeclient = New-Object IO.Pipes.NamedPipeClientStream($ComputerName, $pipename, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::None, [Security.Principal.TokenImpersonationLevel]::Impersonation)
-
-        # Build loader
-        $loader = ''
-        $loader += '$s = New-Object IO.Pipes.NamedPipeServerStream(''' + $pipename + ''', 3); '
-        $loader += '$s.WaitForConnection(); '
-        $loader += '$r = New-Object IO.StreamReader $s; '
-        $loader += '$x = ''''; '
-        $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
-        $loader += '$z = [ScriptBlock]::Create($x); '
-        $loader += '& $z'
-        $argument = '-NoP -NonI -W 1 -C "' + $loader + '"'
-
-        # Build payload
-        $script = ''
-        $script += '[ScriptBlock]$scriptBlock = {' + $ScriptBlock.Ast.Extent.Text + '}' + [Environment]::NewLine -replace '{{','{' -replace '}}','}'
-        if ($ArgumentList) {
-            $args = $ArgumentList -join ','
-            $script += '$args = ' + $args + [Environment]::NewLine
+        $loggedonUsers = @()
+        if ($Identity -eq '*') {
+            Get-CimInstance -ClassName Win32_LogonSession -CimSession $cimSession -Verbose:$false | Where-Object {$_.LogonType -ne 3} | ForEach-Object {
+                $session = $_
+                try {
+                    $loggedonUsers += (Get-CimAssociatedInstance -InputObject $session -Association Win32_LoggedOnUser -CimSession $cimSession -ErrorAction Stop -Verbose:$false).Name
+                }
+                catch [Microsoft.Management.Infrastructure.CimException] {
+                    break
+                }
+            }
+            $loggedonUsers = $loggedonUsers | Select -Unique
         }
         else {
-            $script += '$args = $null' + [Environment]::NewLine
+            $loggedonUsers += $Identity
         }
-        $script += '$output = [Management.Automation.PSSerializer]::Serialize(((New-Module -ScriptBlock $scriptBlock -ArgumentList $args -ReturnResult) *>&1))' + [Environment]::NewLine
-        $script += '$encOutput = [char[]]$output' + [Environment]::NewLine
-        $script += '$writer = [IO.StreamWriter]::new($s)' + [Environment]::NewLine
-        $script += '$writer.AutoFlush = $true' + [Environment]::NewLine
-        $script += '$writer.WriteLine($encOutput)' + [Environment]::NewLine
-        $script += '$writer.Dispose()' + [Environment]::NewLine
-        $script += '$r.Dispose()' + [Environment]::NewLine
-        $script += '$s.Dispose()' + [Environment]::NewLine
-        $script = $script -creplace '(?m)^\s*\r?\n',''
-        $payload = [char[]] $script
 
-        # Create scheduled task
-        try {
-            $taskParameters = @{
-                TaskName = [guid]::NewGuid().Guid
-                Action = New-ScheduledTaskAction -WorkingDirectory "%windir%\System32\WindowsPowerShell\v1.0\" -Execute "powershell" -Argument $argument
-                Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-                Principal = New-ScheduledTaskPrincipal -UserID $Identity -LogonType Interactive -RunLevel Highest -CimSession $cimSession
-            }
-            Write-Verbose "Registering scheduled task $($taskParameters.TaskName)"
-            $scheduledTask = Register-ScheduledTask @taskParameters -CimSession $cimSession -ErrorAction Stop
-            Write-Verbose "Running scheduled task as $Identity"
-            $cimJob = $scheduledTask | Start-ScheduledTask -AsJob -ErrorAction Stop
+        foreach ($loggedonUser in $loggedonUsers) {
+            # Init named pipe client
+            $pipeTimeout = 10000 # 10s
+            $pipename = [guid]::NewGuid().Guid
+            $pipeclient = New-Object IO.Pipes.NamedPipeClientStream($ComputerName, $pipename, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::None, [Security.Principal.TokenImpersonationLevel]::Impersonation)
 
-            Write-Verbose "Connecting to named pipe server \\$ComputerName\pipe\$pipename"
-            $pipeclient.Connect($timeout)
-            $writer = New-Object  IO.StreamWriter($pipeclient)
-            $writer.AutoFlush = $true
-            $writer.WriteLine($payload)
-            $reader = New-Object IO.StreamReader($pipeclient)
-            $output = ''
-            while (($data = $reader.ReadLine()) -ne $null) {
-                $output += $data + [Environment]::NewLine
-            }
-            Write-Output ([Management.Automation.PSSerializer]::Deserialize($output))
+            # Build loader
+            $loader = ''
+            $loader += '$s = New-Object IO.Pipes.NamedPipeServerStream(''' + $pipename + ''', 3); '
+            $loader += '$s.WaitForConnection(); '
+            $loader += '$r = New-Object IO.StreamReader $s; '
+            $loader += '$x = ''''; '
+            $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
+            $loader += '$z = [ScriptBlock]::Create($x); '
+            $loader += '& $z'
+            $argument = '-NoP -NonI -W 1 -C "' + $loader + '"'
 
-            $scheduledTaskInfo = $scheduledTask | Get-ScheduledTaskInfo
-            if ($scheduledTaskInfo.LastRunTime.Year -ne (Get-Date).Year) { 
-                Write-Warning "Failed to execute scheduled task."
-            }
-        }
-        catch { 
-            Write-Error "Task execution failed. $_"
-        }
-        finally {
-            if ($reader) {
-                $reader.Dispose()
-            }
-            $pipeclient.Dispose()
-
-            Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)"
-            if ($Protocol -eq 'Wsman') {
-                $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$False | Out-Null
+            # Build payload
+            $script = ''
+            $script += '[ScriptBlock]$scriptBlock = {' + $ScriptBlock.Ast.Extent.Text + '}' + [Environment]::NewLine -replace '{{','{' -replace '}}','}'
+            if ($ArgumentList) {
+                $args = $ArgumentList -join ','
+                $script += '$args = ' + $args + [Environment]::NewLine
             }
             else {
-                $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask | Out-Null
+                $script += '$args = $null' + [Environment]::NewLine
+            }
+            $script += '$output = [Management.Automation.PSSerializer]::Serialize(((New-Module -ScriptBlock $scriptBlock -ArgumentList $args -ReturnResult) *>&1))' + [Environment]::NewLine
+            $script += '$encOutput = [char[]]$output' + [Environment]::NewLine
+            $script += '$writer = [IO.StreamWriter]::new($s)' + [Environment]::NewLine
+            $script += '$writer.AutoFlush = $true' + [Environment]::NewLine
+            $script += '$writer.WriteLine($encOutput)' + [Environment]::NewLine
+            $script += '$writer.Dispose()' + [Environment]::NewLine
+            $script += '$r.Dispose()' + [Environment]::NewLine
+            $script += '$s.Dispose()' + [Environment]::NewLine
+            $script = $script -creplace '(?m)^\s*\r?\n',''
+            $payload = [char[]] $script
+
+            # Create scheduled task
+            try {
+                $taskParameters = @{
+                    TaskName = [guid]::NewGuid().Guid
+                    Action = New-ScheduledTaskAction -WorkingDirectory "%windir%\System32\WindowsPowerShell\v1.0\" -Execute "powershell" -Argument $argument
+                    Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                    Principal = New-ScheduledTaskPrincipal -UserID $loggedonUser -LogonType Interactive -RunLevel Highest -CimSession $cimSession
+                }
+                Write-Verbose "Registering scheduled task $($taskParameters.TaskName)"
+                $scheduledTask = Register-ScheduledTask @taskParameters -CimSession $cimSession -ErrorAction Stop
+                Write-Verbose "Running scheduled task as $loggedonUser"
+                $cimJob = $scheduledTask | Start-ScheduledTask -AsJob -ErrorAction Stop
+
+                Write-Verbose "Connecting to named pipe server \\$ComputerName\pipe\$pipename"
+                $pipeclient.Connect($pipeTimeout)
+                $writer = New-Object  IO.StreamWriter($pipeclient)
+                $writer.AutoFlush = $true
+                $writer.WriteLine($payload)
+                $reader = New-Object IO.StreamReader($pipeclient)
+                $output = ''
+                while (($data = $reader.ReadLine()) -ne $null) {
+                    $output += $data + [Environment]::NewLine
+                }
+                Write-Output ([Management.Automation.PSSerializer]::Deserialize($output))
+
+                $scheduledTaskInfo = $scheduledTask | Get-ScheduledTaskInfo
+                if ($scheduledTaskInfo.LastRunTime.Year -ne (Get-Date).Year) { 
+                    Write-Warning "Failed to execute scheduled task."
+                }
+            }
+            catch { 
+                Write-Error "Task execution failed. $_"
+            }
+            finally {
+                if ($reader) {
+                    $reader.Dispose()
+                }
+                $pipeclient.Dispose()
+
+                Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)"
+                if ($Protocol -eq 'Wsman') {
+                    $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$False | Out-Null
+                }
+                else {
+                    $scheduledTask | Get-ScheduledTask -ErrorAction SilentlyContinue | Unregister-ScheduledTask | Out-Null
+                }
             }
         }
     }
