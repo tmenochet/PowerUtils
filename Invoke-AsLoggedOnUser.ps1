@@ -61,19 +61,19 @@ Function Invoke-AsLoggedOnUser {
     foreach ($loggedonUser in $loggedonUsers) {
         # Init variables
         $timeout = 10000 # 10s
-        $pipename = [guid]::NewGuid().Guid
+        $pipeName = [guid]::NewGuid().Guid
         $Global:output = $null
 
         # Build loader
         $loader = ''
-        $loader += '$c = New-Object IO.Pipes.NamedPipeClientStream(''.'', ''' + $pipename + ''', [IO.Pipes.PipeDirection]::InOut); '
+        $loader += '$c = New-Object IO.Pipes.NamedPipeClientStream(''.'', ''' + $pipeName + ''', [IO.Pipes.PipeDirection]::InOut); '
         $loader += '$c.Connect(' + $timeout + '); '
         $loader += '$r = New-Object IO.StreamReader $c; '
         $loader += '$x = ''''; '
         $loader += 'while (($y=$r.ReadLine()) -ne ''''){$x+=$y+[Environment]::NewLine}; '
         $loader += '$z = [ScriptBlock]::Create($x); '
         $loader += '& $z'
-        $arguments = '-NoP -NonI -W 1 -C "' + $loader + '"'
+        $arguments = '-NoP -NonI -C "' + $loader + '"'
 
         # Build payload
         $script = ''
@@ -102,23 +102,32 @@ Function Invoke-AsLoggedOnUser {
             $accessRule = New-Object IO.Pipes.PipeAccessRule($everyoneSid, "FullControl", "Allow")
             $pipeSecurity = New-Object IO.Pipes.PipeSecurity
             $pipeSecurity.AddAccessRule($accessRule)
-            $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipename, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
+            $pipeServer = New-Object IO.Pipes.NamedPipeServerStream($pipeName, [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous, 32768, 32768, $pipeSecurity)
             $serverCallback = [AsyncCallback] {
                 Param ([IAsyncResult] $iar)
-                Write-Verbose "Client connected to named pipe server \\.\pipe\$pipename"
-                $pipeServer.EndWaitForConnection($iar)
-                Write-Verbose "Delivering payload"
-                $writer = New-Object IO.StreamWriter($pipeServer)
-                $writer.AutoFlush = $true
-                $writer.WriteLine($payload)
-                Write-Verbose "Getting execution output"
-                $reader = New-Object IO.StreamReader($pipeServer)
-                $output = ''
-                while (($data = $reader.ReadLine()) -ne $null) {
-                    $output += $data + [Environment]::NewLine
+                try {
+                    Write-Verbose "Client connected to named pipe server \\.\pipe\$pipeName..."
+                    $pipeServer.EndWaitForConnection($iar)
+                    Write-Verbose "Delivering payload..."
+                    $writer = New-Object IO.StreamWriter($pipeServer)
+                    $writer.AutoFlush = $true
+                    $writer.WriteLine($payload)
+                    Write-Verbose "Getting execution output..."
+                    $reader = New-Object IO.StreamReader($pipeServer)
+                    $output = ''
+                    while (($data = $reader.ReadLine()) -ne $null) {
+                        $output += $data + [Environment]::NewLine
+                    }
+                    $Global:output = ([Management.Automation.PSSerializer]::Deserialize($output))
                 }
-                $Global:output = ([Management.Automation.PSSerializer]::Deserialize($output))
-                $reader.Dispose()
+                catch {
+                    Write-Verbose "Error occured. $_"
+                }
+                finally {
+                    if ($reader) {
+                        $reader.Dispose()
+                    }
+                }
             }
             $runspacedDelegate = [RunspacedDelegateFactory]::NewRunspacedDelegate($serverCallback, [Runspace]::DefaultRunspace)
             $job = $pipeServer.BeginWaitForConnection($runspacedDelegate, $null)
@@ -171,6 +180,7 @@ Function Local:Invoke-ScheduledTaskCmd {
         $taskDefinition = $scheduleService.NewTask(0)
         $taskDefinition.Settings.StopIfGoingOnBatteries = $false
         $taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+        $taskDefinition.Settings.Hidden = $true
         $taskDefinition.Principal.UserID = $Identity
         $taskDefinition.Principal.LogonType = 3
         $taskDefinition.Principal.RunLevel = 1
@@ -184,9 +194,9 @@ Function Local:Invoke-ScheduledTaskCmd {
         }
         catch {}
 
-        Write-Verbose "Registering scheduled task $taskName"
+        Write-Verbose "Registering scheduled task $taskName..."
         $registeredTask = $scheduleTaskFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, $Identity, $null, 3)
-        Write-Verbose "Running scheduled task as $Identity"
+        Write-Verbose "Running scheduled task as $Identity..."
         $scheduledTask = $registeredTask.Run($null)
         do {
             $scheduledTaskInfo = $scheduleTaskFolder.GetTasks(1) | Where-Object Name -eq $scheduledTask.Name; Start-Sleep -Milliseconds 100
@@ -197,15 +207,15 @@ Function Local:Invoke-ScheduledTaskCmd {
         }
         while ($scheduledTaskInfo.State -eq 4)
         if ($scheduledTaskInfo.LastRunTime.Year -ne (Get-Date).Year) { 
-            Write-Warning "Failed to execute scheduled task."
+            Write-Warning "Failed to execute scheduled task as $Identity."
         }
     }
     catch { 
         Write-Error "Task execution failed. $_"
     }
     finally {
-        Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)"
         if ($scheduledTask) { 
+            Write-Verbose "Unregistering scheduled task $($taskParameters.TaskName)..."
             $scheduleTaskFolder.DeleteTask($scheduledTask.Name, 0) | Out-Null
         }
     }
@@ -601,7 +611,7 @@ Function Local:Invoke-TokenCmd {
             if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) {
                 $ownerInfo = $process.GetOwner()
                 $ownerString = "$($ownerInfo.Domain)\$($ownerInfo.User)".ToUpper()
-                if ($ownerString -eq $Identity.ToUpper()) {
+                if ($ownerString -match "$($Identity.ToUpper().replace('\','\\'))`$") {
                     try {
                         $hToken = Get-PrimaryToken -ProcessId $process.ProcessId -FullPrivs
                         if ($hToken -ne [IntPtr]::Zero) {
@@ -619,7 +629,7 @@ Function Local:Invoke-TokenCmd {
             Write-Error 'Unable to obtain a handle to a user process.'
         }
 
-        Write-Verbose "Reverting the current thread privileges"
+        Write-Verbose "Reverting the current thread privileges..."
         if (-not $RevertToSelf.Invoke()) {
             Write-Warning "RevertToSelf failed."
         }
